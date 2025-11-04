@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Experiment artifacts
+wandb/
+runs/
+outputs/
+checkpoints/
+logs/
+**/checkpoints/
+**/logs/
+
+# Project data and caches
+data/
+cache/
+preprocessed/
+models/
+results/
+results/layer_selection/
+**/cache/
+**/preprocessed/
+**/models/
+**/results/
+Classification/preprocessed/
+TextualEntailment/preprocessed/
+
+# Generated files
+*.pt
+*.bin
+*.ckpt
+*.pkl
+*.npz
+*.log
+.requirements.no-torch.txt
+*.tar.gz
+*.tar
+*.zip
+
+# OS / Editors
+.DS_Store
+.idea/
+.vscode/

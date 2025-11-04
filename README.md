@@ -75,18 +75,20 @@ python main.py --task classification --job=training --task_dataset=sst2 --test_d
 python main.py --task classification --job=testing --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=base
 
 # Training with LLM plugin (PiFi)
-python main.py --task classification --job=training --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm=llama3.1
+python main.py --task classification --job=training --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
 
 # Testing with LLM plugin (PiFi)
-python main.py --task classification --job=testing --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm=llama3.1
+python main.py --task classification --job=testing --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
 ```
 
 #### Available Parameters:
 - `--task_dataset`: Dataset name (sst2, imdb, tweet_sentiment_binary, tweet_offensive, cola)
 - `--model_type`: Base model type (bert, roberta, albert, electra, deberta, debertav3)
 - `--method`: Training method (base, pifi)
-- `--llm`: LLM to use for plugin (llama3.1, mistral0.1, mistral0.3, qwen2_7b, gemma2, falcon)
+- `--llm_model`: LLM to use for plugin (llama3.1, mistral0.1, mistral0.3, qwen2_7b, gemma2, falcon)
 - `--job`: Operation to perform (preprocessing, training, testing)
+ - `--auto_select_layer`: Automatically select LLM layer (true/false)
+ - `--selection_samples`, `--selection_pcs`, `--selection_top_pc`: Selection controls
 
 ### Textual Entailment Tasks
 
@@ -112,18 +114,20 @@ python main.py --task entailment --job=training --task_dataset=mnli --test_datas
 python main.py --task entailment --job=testing --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=base
 
 # Training with LLM plugin (PiFi)
-python main.py --task entailment --job=training --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm=llama3.1
+python main.py --task entailment --job=training --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
 
 # Testing with LLM plugin (PiFi)
-python main.py --task entailment --job=testing --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm=llama3.1
+python main.py --task entailment --job=testing --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
 ```
 
 #### Available Parameters:
 - `--task_dataset`: Dataset name (mnli, snli)
 - `--model_type`: Base model type (bert, roberta, albert, electra, deberta, debertav3)
 - `--method`: Training method (base, pifi)
-- `--llm`: LLM to use for plugin (llama3.1, mistral0.1, mistral0.3, qwen2_7b, gemma2, falcon)
+- `--llm_model`: LLM to use for plugin (llama3.1, mistral0.1, mistral0.3, qwen2_7b, gemma2, falcon)
 - `--job`: Operation to perform (preprocessing, training, testing)
+ - `--auto_select_layer`: Automatically select LLM layer (true/false)
+ - `--selection_samples`, `--selection_pcs`, `--selection_top_pc`: Selection controls
 
 ## Experimental Setup
 

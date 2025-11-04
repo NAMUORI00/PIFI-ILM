@@ -54,6 +54,9 @@ class ArgParser():
         llm_model_list = ['llama2', 'llama3','llama3.1','llama3.1_instruct', 'mistral0.1', 'mistral0.3', 'qwen2_7b', 'qwen2_0.5b', 'qwen2_1.5b', 'qwen2_72b', 'gemma2', 'falcon', 'kollama', 'gerllama', 'chillama']
         self.parser.add_argument('--llm_model', type=str, choices=llm_model_list, default='llama3.1',
                                     help='LLM model to use; Default is llama3')
+        # Backward-compat alias
+        self.parser.add_argument('--llm', dest='llm_model', type=str, choices=llm_model_list,
+                                    help='Alias for --llm_model')
         self.parser.add_argument('--model_ispretrained', type=parse_bool, default=True,
                                  help='Whether to use pretrained model; Default is True')
         self.parser.add_argument('--rnn_isbidirectional', type=parse_bool, default=True,
@@ -82,6 +85,15 @@ class ArgParser():
                                  help='Number of heads of Transformer Encoder; Default is 8')
         self.parser.add_argument('--layer_num', type=int, default=-1,
                                  help='Layer number of the LLM model; Default is -1')
+        # Auto layer selection (ILM-inspired)
+        self.parser.add_argument('--auto_select_layer', type=parse_bool, default=False,
+                                 help='Automatically select LLM layer before training (PC patching on SLM). Default False')
+        self.parser.add_argument('--selection_samples', type=int, default=400,
+                                 help='Number of samples for layer selection')
+        self.parser.add_argument('--selection_pcs', type=int, default=16,
+                                 help='Number of principal components per layer for selection')
+        self.parser.add_argument('--selection_top_pc', type=int, default=5,
+                                 help='Top PCs by label-correlation to patch')
 
         # Model - Optimizer & Scheduler arguments
         optim_list = ['SGD', 'AdaDelta', 'Adam', 'AdamW']
