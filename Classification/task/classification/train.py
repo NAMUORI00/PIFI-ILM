@@ -2,6 +2,7 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false" 
 import sys
 import shutil
+import subprocess
 import logging
 import argparse
 from tqdm.auto import tqdm
@@ -53,7 +54,7 @@ def training(args: argparse.Namespace) -> None:
     write_log(logger, f"Valid dataset size / iterations: {len(dataset_dict['valid'])} / {len(dataloader_dict['valid'])}")
 
     # Optional: auto-select LLM layer before building model
-    if getattr(args, 'auto_select_layer', False) and args.method == 'pifi':
+    if getattr(args, 'auto_select_layer', False) and args.method == 'pifi' and getattr(args, 'layer_num', -1) < 0:
         if auto_select_layer is None:
             print("[selection] Module not available; skipping auto selection")
         else:
@@ -95,20 +96,45 @@ def training(args: argparse.Namespace) -> None:
         write_log(logger, f"Loaded checkpoint from {load_checkpoint_name}")
 
         if args.use_wandb:
-            import wandb 
+            import wandb
             from wandb import AlertLevel
-            wandb.init(project=args.proj_name,
-                       name=get_wandb_exp_name(args),
-                       config=args,
-                       notes=args.description,
-                       tags=["TRAIN",
-                             f"Dataset: {args.task_dataset}",
-                             f"Model: {args.model_type}",
-                             f"Method: {args.method}",
-                             f"LLM: {args.llm_model}",
-                             f"LLM_Layer: {args.layer_num}"],
-                       resume=True,
-                       id=checkpoint['wandb_id'])
+
+            def _git_commit():
+                try:
+                    return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+                except Exception:
+                    return None
+
+            project = os.environ.get('WANDB_PROJECT') or args.proj_name
+            entity = os.environ.get('WANDB_ENTITY')
+            init_kwargs = dict(
+                project=project,
+                name=get_wandb_exp_name(args),
+                config=args,
+                notes=args.description,
+                tags=["TRAIN",
+                      f"Dataset: {args.task_dataset}",
+                      f"Model: {args.model_type}",
+                      f"Method: {args.method}",
+                      f"LLM: {args.llm_model}",
+                      f"LLM_Layer: {args.layer_num}"],
+                resume=True,
+                id=checkpoint['wandb_id'],
+                settings=wandb.Settings(save_code=True),
+            )
+            if entity:
+                init_kwargs['entity'] = entity
+
+            wandb.init(**init_kwargs)
+            try:
+                commit = _git_commit()
+                if commit:
+                    wandb.config.update({'git_commit': commit}, allow_val_change=True)
+                    short = commit[:7]
+                    wandb.run.tags = list(set(list(wandb.run.tags or []) + [f"GIT:{short}"]))
+                wandb.log_code(root=os.getcwd())
+            except Exception:
+                pass
             wandb.watch(models=model, criterion=cls_loss, log='all', log_freq=10)
         del checkpoint
 
@@ -117,18 +143,42 @@ def training(args: argparse.Namespace) -> None:
         writer.add_text('args', str(args))
 
     if args.use_wandb and args.job == 'training':
-        import wandb 
+        import wandb
         from wandb import AlertLevel
-        wandb.init(project=args.proj_name,
-                       name=get_wandb_exp_name(args),
-                       config=args,
-                       notes=args.description,
-                       tags=["TRAIN",
-                             f"Dataset: {args.task_dataset}",
-                             f"Model: {args.model_type}",
-                             f"Method: {args.method}",
-                             f"LLM: {args.llm_model}",
-                             f"LLM_Layer: {args.layer_num}"])
+
+        def _git_commit():
+            try:
+                return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+            except Exception:
+                return None
+
+        project = os.environ.get('WANDB_PROJECT') or args.proj_name
+        entity = os.environ.get('WANDB_ENTITY')
+        init_kwargs = dict(
+            project=project,
+            name=get_wandb_exp_name(args),
+            config=args,
+            notes=args.description,
+            tags=["TRAIN",
+                  f"Dataset: {args.task_dataset}",
+                  f"Model: {args.model_type}",
+                  f"Method: {args.method}",
+                  f"LLM: {args.llm_model}",
+                  f"LLM_Layer: {args.layer_num}"],
+            settings=wandb.Settings(save_code=True),
+        )
+        if entity:
+            init_kwargs['entity'] = entity
+        wandb.init(**init_kwargs)
+        try:
+            commit = _git_commit()
+            if commit:
+                wandb.config.update({'git_commit': commit}, allow_val_change=True)
+                short = commit[:7]
+                wandb.run.tags = list(set(list(wandb.run.tags or []) + [f"GIT:{short}"]))
+            wandb.log_code(root=os.getcwd())
+        except Exception:
+            pass
         wandb.watch(models=model, criterion=cls_loss, log='all', log_freq=10)
 
     best_epoch_idx = 0

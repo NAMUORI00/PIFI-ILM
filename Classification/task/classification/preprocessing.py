@@ -45,19 +45,35 @@ def load_data(args: argparse.Namespace) -> tuple:
     }
 
     if name == 'sst2':
-        dataset = load_dataset('SetFit/sst2')
+        # Prefer SetFit/sst2; fallback to GLUE sst2 if unavailable
+        try:
+            dataset = load_dataset('SetFit/sst2')
 
-        train_df = pd.DataFrame(dataset['train'])
-        valid_df = pd.DataFrame(dataset['validation'])
-        test_df = pd.DataFrame(dataset['test'])
-        num_classes = 2
+            train_df = pd.DataFrame(dataset['train'])
+            valid_df = pd.DataFrame(dataset['validation'])
+            test_df = pd.DataFrame(dataset['test'])
+            num_classes = 2
 
-        train_data['text'] = train_df['text'].tolist()
-        train_data['label'] = train_df['label'].tolist()
-        valid_data['text'] = valid_df['text'].tolist()
-        valid_data['label'] = valid_df['label'].tolist()
-        test_data['text'] = test_df['text'].tolist()
-        test_data['label'] = test_df['label'].tolist()
+            train_data['text'] = train_df['text'].tolist()
+            train_data['label'] = train_df['label'].tolist()
+            valid_data['text'] = valid_df['text'].tolist()
+            valid_data['label'] = valid_df['label'].tolist()
+            test_data['text'] = test_df['text'].tolist()
+            test_data['label'] = test_df['label'].tolist()
+        except Exception:
+            dataset = load_dataset('glue', 'sst2')
+
+            train_df = pd.DataFrame(dataset['train'])
+            valid_df = pd.DataFrame(dataset['validation'])
+            test_df = pd.DataFrame(dataset['test'])
+            num_classes = 2
+
+            train_data['text'] = train_df['sentence'].tolist()
+            train_data['label'] = train_df['label'].tolist()
+            valid_data['text'] = valid_df['sentence'].tolist()
+            valid_data['label'] = valid_df['label'].tolist()
+            test_data['text'] = test_df['sentence'].tolist()
+            test_data['label'] = test_df['label'].tolist()
     if name == 'sst5':
         dataset = load_dataset('SetFit/sst5')
 

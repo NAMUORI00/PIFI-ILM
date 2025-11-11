@@ -22,19 +22,24 @@ This approach allows SLMs to leverage the knowledge encoded in LLM's final repre
 
 ```
 PiFi/
-├── Classification/          # Classification task implementation
-│   ├── main.py             # Main training/testing script
-│   ├── run_classification.sh # Shell script for running experiments
-│   ├── model/              # Model implementations
-│   ├── task/               # Task-specific code
-│   └── utils/              # Utility functions
-├── TextualEntailment/      # Textual entailment task implementation
-│   ├── main.py             # Main training/testing script  
-│   ├── run_entailment.sh   # Shell script for running experiments
-│   ├── model/              # Model implementations
-│   ├── task/               # Task-specific code
-│   └── utils/              # Utility functions
-└── requirements.txt        # Python dependencies
+├── main.py                  # Unified entry point for all tasks
+├── core/                    # Shared utilities and pipeline
+│   ├── arguments.py         # Unified argument parser
+│   ├── utils.py             # Common utility functions
+│   └── pipeline.py          # Task dispatcher and ILM integration
+├── tasks/                   # Task implementations
+│   ├── classification/      # Classification tasks (SST-2, IMDB, etc.)
+│   └── entailment/          # Textual entailment tasks (MNLI, SNLI)
+├── selection/               # ILM layer selection
+│   └── ilm_direct.py        # Auto layer selection logic
+├── scripts/                 # Experiment scripts
+│   ├── run_experiments.sh   # Unified experiment runner
+│   ├── run_classification.sh # Classification-only wrapper
+│   ├── run_entailment.sh    # Entailment-only wrapper
+│   └── README.md            # Detailed script documentation
+├── Classification/          # Legacy structure (still functional)
+├── TextualEntailment/       # Legacy structure (still functional)
+└── requirements.txt         # Python dependencies
 ```
 
 ## Installation
@@ -52,34 +57,77 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Quick Start
+
+The repository provides a unified entry point and experiment scripts:
+
+```bash
+# Run all experiments (classification + entailment)
+bash scripts/run_experiments.sh
+
+# Run classification only
+bash scripts/run_classification.sh
+
+# Run entailment only
+bash scripts/run_entailment.sh
+
+# Run with ILM auto layer selection
+bash scripts/run_with_ilm.sh
+```
+
+### Unified Main Script
+
+All tasks can be run using the unified `main.py`:
+
+```bash
+# Classification
+python main.py --task classification --job training --task_dataset sst2 --method pifi
+
+# Entailment
+python main.py --task entailment --job training --task_dataset mnli --method pifi
+
+# With ILM auto-selection
+python main.py --task classification --job training --task_dataset sst2 \
+    --method pifi --llm_model llama3.1 --auto_select_layer true
+```
+
 ### Classification Tasks
 
 The classification module supports multiple datasets: SST-2, IMDB, Tweet Sentiment Binary, Tweet Offensive, and CoLA.
 
 #### Running Classification Experiments
 
-Use the provided shell script to run all classification experiments:
+**Using the unified script (recommended):**
 ```bash
-cd Classification
-bash run_classification.sh
+# Run all classification datasets with ILM
+TASKS="classification" USE_ILM=true bash scripts/run_experiments.sh
+
+# Run specific datasets
+TASKS="classification" DATASETS="sst2 imdb" bash scripts/run_experiments.sh
+
+# Custom configuration
+LLM=llama3.1 MODEL=roberta EPOCHS=5 BS=16 \
+TASKS="classification" bash scripts/run_experiments.sh
 ```
 
-Or run individual experiments:
+**Using main.py directly:**
 ```bash
 # Preprocessing
-python main.py --task classification --job=preprocessing --task_dataset=sst2 --model_type=bert
+python main.py --task classification --job preprocessing --task_dataset sst2
 
 # Training baseline model
-python main.py --task classification --job=training --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=base
+python main.py --task classification --job training --task_dataset sst2 --method base
 
 # Testing baseline model
-python main.py --task classification --job=testing --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=base
+python main.py --task classification --job testing --task_dataset sst2 --method base
 
-# Training with LLM plugin (PiFi)
-python main.py --task classification --job=training --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
+# Training with PiFi + ILM auto-selection
+python main.py --task classification --job training --task_dataset sst2 \
+    --method pifi --llm_model llama3.1 --auto_select_layer true
 
-# Testing with LLM plugin (PiFi)
-python main.py --task classification --job=testing --task_dataset=sst2 --test_dataset=sst2 --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
+# Testing with PiFi
+python main.py --task classification --job testing --task_dataset sst2 \
+    --method pifi --llm_model llama3.1
 ```
 
 #### Available Parameters:
@@ -97,28 +145,37 @@ The textual entailment module supports MNLI and SNLI datasets.
 
 #### Running Entailment Experiments
 
-Use the provided shell script to run all entailment experiments:
+**Using the unified script (recommended):**
 ```bash
-cd TextualEntailment
-bash run_entailment.sh
+# Run all entailment datasets with ILM
+TASKS="entailment" USE_ILM=true bash scripts/run_experiments.sh
+
+# Run specific datasets
+TASKS="entailment" DATASETS="mnli snli" bash scripts/run_experiments.sh
+
+# Custom configuration
+LLM=llama3.1 MODEL=roberta EPOCHS=5 \
+TASKS="entailment" bash scripts/run_experiments.sh
 ```
 
-Or run individual experiments:
+**Using main.py directly:**
 ```bash
 # Preprocessing
-python main.py --task entailment --job=preprocessing --task_dataset=mnli --model_type=bert
+python main.py --task entailment --job preprocessing --task_dataset mnli
 
 # Training baseline model
-python main.py --task entailment --job=training --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=base
+python main.py --task entailment --job training --task_dataset mnli --method base
 
-# Testing baseline model  
-python main.py --task entailment --job=testing --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=base
+# Testing baseline model
+python main.py --task entailment --job testing --task_dataset mnli --method base
 
-# Training with LLM plugin (PiFi)
-python main.py --task entailment --job=training --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
+# Training with PiFi + ILM auto-selection
+python main.py --task entailment --job training --task_dataset mnli \
+    --method pifi --llm_model llama3.1 --auto_select_layer true
 
-# Testing with LLM plugin (PiFi)
-python main.py --task entailment --job=testing --task_dataset=mnli --test_dataset=mnli --model_type=bert --method=pifi --llm_model=llama3.1 --auto_select_layer true
+# Testing with PiFi
+python main.py --task entailment --job testing --task_dataset mnli \
+    --method pifi --llm_model llama3.1
 ```
 
 #### Available Parameters:

@@ -50,6 +50,7 @@ for DS in ${DATASETS}; do
   # 3) PiFi train with ILM auto selection
   python main.py --task entailment --job=training --task_dataset="$DS" --test_dataset="$DS" --method=pifi --llm "$LLM" \
     --auto_select_layer true --selection_samples "$SEL_SAMPLES" --selection_pcs "$SEL_PCS" --selection_top_pc "$SEL_TOP_PC" \
+    --selection_pooling mean --selection_dtype fp16 --selection_max_length 128 \
     --num_epochs="$EPOCHS" --batch_size="$BS" --num_workers="$WORKERS" --use_wandb false --use_tensorboard false "${COMMON_ARGS[@]}"
 
   # 4) PiFi test using the selected layer
@@ -74,4 +75,3 @@ PY
 done
 
 echo "[ILM] Completed entailment experiments with ILM selection."
-

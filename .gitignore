@@ -16,6 +16,7 @@ checkpoints/
 logs/
 **/checkpoints/
 **/logs/
+**/tensorboard_logs/
 
 # Project data and caches
 data/
@@ -28,6 +29,9 @@ results/layer_selection/
 **/preprocessed/
 **/models/
 **/results/
+.archive/
+.env
+.archive/
 Classification/preprocessed/
 TextualEntailment/preprocessed/
 
@@ -38,7 +42,6 @@ TextualEntailment/preprocessed/
 *.pkl
 *.npz
 *.log
-.requirements.no-torch.txt
 *.tar.gz
 *.tar
 *.zip

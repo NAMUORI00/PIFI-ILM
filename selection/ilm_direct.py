@@ -10,7 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 
 
-def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42) -> Tuple[List[str], List[int]]:
+def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation') -> Tuple[List[str], List[int]]:
     from datasets import load_dataset
 
     rng = np.random.default_rng(seed)
@@ -29,8 +29,16 @@ def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42) ->
             labels.append(int(item[label_key]))
 
     if name == "sst2":
-        ds = load_dataset("SetFit/sst2")
-        take_subset(ds["validation"], "text", "label")
+        # Prefer SetFit/sst2; fallback to GLUE sst2 with proper text key
+        try:
+            ds = load_dataset("SetFit/sst2")
+            chosen = ds.get(split if split in ds else "validation")
+            take_subset(chosen, "text", "label")
+        except Exception:
+            ds = load_dataset("glue", "sst2")
+            mapping = {"train":"train", "validation":"validation", "test":"test"}
+            chosen = ds[mapping.get(split, "validation")]
+            take_subset(chosen, "sentence", "label")
     elif name == "imdb":
         ds = load_dataset("imdb")
         take_subset(ds["test"], "text", "label")
@@ -53,7 +61,9 @@ def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42) ->
             labels.append(lab)
     elif name == "mnli":
         ds = load_dataset("glue", "mnli")
-        val = ds["validation_matched"]
+        # Map generic split to mnli split name
+        split_map = {"train":"train", "validation":"validation_matched", "test":"validation_matched"}
+        val = ds[split_map.get(split, "validation_matched")]
         n = min(n_samples, len(val))
         idx = rng.choice(len(val), size=n, replace=False)
         for i in idx:
@@ -89,7 +99,7 @@ def _pool_hidden(hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -
 
 
 @torch.no_grad()
-def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", max_length: int = 128, batch_size: int = 16, dtype: Optional[torch.dtype] = None) -> List[np.ndarray]:
+def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", max_length: int = 128, batch_size: int = 16, dtype: Optional[torch.dtype] = None, pooling: str = 'first') -> List[np.ndarray]:
     tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
     model = AutoModel.from_pretrained(llm_id)
     if device == "cuda" and torch.cuda.is_available():
@@ -102,7 +112,6 @@ def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", 
     model.eval()
 
     all_layers: List[np.ndarray] = []
-    hidden_states_sample = None
     # First pass to determine number of layers
     enc0 = tokenizer(texts[:1], padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     enc0 = {k: v.to(device) for k, v in enc0.items()}
@@ -118,7 +127,10 @@ def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", 
         out = model(**enc, output_hidden_states=True)
         hs = list(out.hidden_states)[1:]  # skip embeddings
         for li, h in enumerate(hs):
-            pooled = _pool_hidden(h, enc.get("attention_mask"))
+            if pooling == 'first':
+                pooled = h[:, 0]
+            else:
+                pooled = _pool_hidden(h, enc.get("attention_mask"))
             pooled_np = pooled.detach().float().cpu().numpy()
             all_layers[li] = np.vstack([all_layers[li], pooled_np])
     return all_layers
@@ -194,15 +206,31 @@ def auto_select_layer(args) -> int:
     n_pcs = int(getattr(args, "selection_pcs", 16))
     top_pc = int(getattr(args, "selection_top_pc", 5))
     seed = int(getattr(args, "seed", 2023))
-    lambdas = tuple(getattr(args, "selection_patch_lambda", (0.5, 1.0))) if isinstance(getattr(args, "selection_patch_lambda", (0.5, 1.0)), (list, tuple)) else (0.5, 1.0)
+    # lambdas parsing supports str (comma-separated) or list/tuple
+    _lam = getattr(args, "selection_patch_lambda", (0.5, 1.0))
+    if isinstance(_lam, str):
+        try:
+            lambdas = tuple(float(x.strip()) for x in _lam.split(",") if x.strip())
+        except Exception:
+            lambdas = (0.5, 1.0)
+    elif isinstance(_lam, (list, tuple)):
+        lambdas = tuple(float(x) for x in _lam)
+    else:
+        lambdas = (0.5, 1.0)
+
     stride = int(getattr(args, "selection_layer_stride", 1))
+    split = getattr(args, "selection_split", 'validation')
+    pooling = getattr(args, "selection_pooling", 'first')
+    # max_length: use selection_max_length >0 else fall back to args.max_seq_len if present else 128
+    sel_max_len = int(getattr(args, "selection_max_length", 0) or getattr(args, "max_seq_len", 128) or 128)
+    dtype_pref = getattr(args, "selection_dtype", 'fp32')
 
     # Resolve huggingface model id for LLM
-    from Classification.utils.utils import get_huggingface_model_name
+    from core.utils import get_huggingface_model_name
     llm_id = get_huggingface_model_name(llm_type)
 
     # Collect data
-    texts, labels = _resolve_dataset(task, dataset, n_samples=n_samples, seed=seed)
+    texts, labels = _resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split)
     if len(texts) < 10:
         print("[selection] Not enough samples; defaulting to mid layer")
         cfg = AutoConfig.from_pretrained(llm_id)
@@ -210,7 +238,8 @@ def auto_select_layer(args) -> int:
 
     # Collect pooled hidden per layer for LLM
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    hidden_per_layer = _get_llm_hidden_layers(llm_id, texts, device=device, max_length=128, batch_size=16)
+    dtype = torch.float16 if (dtype_pref == 'fp16' and device == 'cuda') else torch.float32
+    hidden_per_layer = _get_llm_hidden_layers(llm_id, texts, device=device, max_length=sel_max_len, batch_size=16, dtype=dtype, pooling=pooling)
     y = np.array(labels)
 
     effects: List[float] = []
@@ -247,4 +276,3 @@ def auto_select_layer(args) -> int:
     print(f"[selection] Saved selection to {out_path}")
     print(f"[selection] Best LLM layer: {best_llm_layer}")
     return best_llm_layer
-
