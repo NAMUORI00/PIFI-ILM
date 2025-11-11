@@ -8,6 +8,16 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
+try:
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+except Exception:
+    plt = None
+    sns = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 
 def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation') -> Tuple[List[str], List[int]]:
@@ -256,6 +266,26 @@ def auto_select_layer(args) -> int:
 
     best_llm_layer = int(np.argmax(np.array(effects)))
 
+    # Compute layer x PC correlation matrix for visualization (no extra forward pass)
+    corr_mat = None
+    try:
+        corr_rows: List[np.ndarray] = []
+        for X in hidden_per_layer:
+            # Guard against tiny sample sizes
+            pcs = min(n_pcs, X.shape[0], X.shape[1])
+            if pcs <= 0:
+                corr_rows.append(np.zeros((n_pcs,), dtype=np.float32))
+                continue
+            S, comps = _pca_scores(X, n_components=pcs)
+            corrs = _label_correlation(S, y)
+            # Pad/trim to n_pcs for consistent heatmap width
+            row = np.zeros((n_pcs,), dtype=np.float32)
+            row[:pcs] = corrs[:pcs]
+            corr_rows.append(row)
+        corr_mat = np.stack(corr_rows, axis=0)  # (layers, n_pcs)
+    except Exception as _:
+        corr_mat = None
+
     # Cache result
     out_dir = os.path.join(getattr(args, "result_path", "."), "layer_selection", task, dataset, slm_type, llm_type)
     os.makedirs(out_dir, exist_ok=True)
@@ -275,4 +305,298 @@ def auto_select_layer(args) -> int:
         }, f, indent=2)
     print(f"[selection] Saved selection to {out_path}")
     print(f"[selection] Best LLM layer: {best_llm_layer}")
+
+    # Optional logging to TensorBoard / W&B
+    try:
+        _log_selection_results(args, effects, best_llm_layer, out_path,
+                               n_samples=n_samples, n_pcs=n_pcs, top_pc=top_pc,
+                               corr_mat=corr_mat, hidden_per_layer=hidden_per_layer, labels=y)
+    except Exception as e:
+        print(f"[selection] Logging failed (non-fatal): {e}")
+
+    # Optional archive images to .archive for quick sharing
+    try:
+        _save_selection_plots(args, effects, best_llm_layer, corr_mat=corr_mat,
+                              hidden_per_layer=hidden_per_layer, labels=y)
+    except Exception as e:
+        print(f"[selection] Archiving plots failed (non-fatal): {e}")
     return best_llm_layer
+
+
+def _log_selection_results(args,
+                           effects: List[float],
+                           best_llm_layer: int,
+                           out_path: str,
+                           n_samples: int,
+                           n_pcs: int,
+                           top_pc: int,
+                           corr_mat: Optional[np.ndarray] = None,
+                           hidden_per_layer: Optional[List[np.ndarray]] = None,
+                           labels: Optional[np.ndarray] = None) -> None:
+    """Log ILM selection summary to TensorBoard and W&B (optional)."""
+    # TensorBoard
+    if getattr(args, 'use_tensorboard', False) and getattr(args, 'log_selection', True) and SummaryWriter is not None:
+        try:
+            log_dir = os.path.join(getattr(args, 'log_path', './tensorboard_logs'),
+                                   'selection', f"{args.task}_{args.task_dataset}_{args.model_type}_{args.llm_model}")
+            os.makedirs(log_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir)
+            eff_np = np.array(effects, dtype=np.float32)
+            # Scalars per layer
+            for li, v in enumerate(eff_np):
+                writer.add_scalar('ILM/effect_per_layer', float(v), li)
+            # Histogram
+            writer.add_histogram('ILM/effects_hist', eff_np, 0)
+            # Line plot
+            if plt is not None:
+                fig_line, ax = plt.subplots(figsize=(8, 2.5))
+                ax.plot(list(range(len(eff_np))), eff_np, marker='o')
+                ax.axvline(best_llm_layer, color='r', linestyle='--', label=f'best={best_llm_layer}')
+                ax.set_title('ILM Effect per Layer (line)')
+                ax.set_xlabel('Layer'); ax.set_ylabel('Effect'); ax.legend(loc='upper right')
+                fig_line.tight_layout()
+                writer.add_figure('ILM/effects_line', fig_line, global_step=0)
+                plt.close(fig_line)
+            # Heatmap
+            if plt is not None and sns is not None:
+                fig_hm, ax = plt.subplots(figsize=(10, 2.0))
+                sns.heatmap([eff_np], cmap='viridis', cbar=True, xticklabels=list(range(len(eff_np))), yticklabels=['effect'], ax=ax)
+                ax.axvline(best_llm_layer + 0.5, color='r', linestyle='--')
+                ax.set_title('ILM Effect per Layer (heatmap)')
+                fig_hm.tight_layout()
+                writer.add_figure('ILM/effect_heatmap', fig_hm, global_step=0)
+                plt.close(fig_hm)
+            # Correlation heatmap (layers x PCs)
+            if corr_mat is not None and plt is not None and sns is not None:
+                fig_corr, ax = plt.subplots(figsize=(max(6, n_pcs/2), max(3, corr_mat.shape[0]/4)))
+                sns.heatmap(corr_mat, cmap='magma', cbar=True,
+                            xticklabels=list(range(n_pcs)),
+                            yticklabels=list(range(corr_mat.shape[0])), ax=ax)
+                ax.set_title('ILM Layer x PC Label-Correlation')
+                ax.set_xlabel('PC'); ax.set_ylabel('Layer')
+                fig_corr.tight_layout()
+                writer.add_figure('ILM/corr_heatmap', fig_corr, global_step=0)
+                plt.close(fig_corr)
+
+            # PCA scatter plots for selected layers
+            if getattr(args, 'log_selection_pca', True) and hidden_per_layer is not None and labels is not None and plt is not None:
+                sel_layers = _select_plot_layers(len(hidden_per_layer), best_llm_layer,
+                                                 getattr(args, 'selection_plot_layers', 'best,first,mid,last'),
+                                                 getattr(args, 'selection_plot_max_layers', 6))
+                for li in sel_layers:
+                    X = hidden_per_layer[li]
+                    pcs = min(2, X.shape[0], X.shape[1])
+                    if pcs < 2:
+                        continue
+                    S2, _ = _pca_scores(X, n_components=2)
+                    fig_sc, ax = plt.subplots(figsize=(4, 3))
+                    labs = np.array(labels)
+                    uniq = np.unique(labs)
+                    for c in uniq:
+                        idx = labs == c
+                        ax.scatter(S2[idx, 0], S2[idx, 1], s=8, alpha=0.7, label=str(int(c)))
+                    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+                    ax.set_title(f'PCA Scatter - Layer {li}')
+                    ax.legend(markerscale=2, fontsize=7, loc='best', frameon=False)
+                    fig_sc.tight_layout()
+                    writer.add_figure(f'ILM/pca_scatter_layer_{li}', fig_sc, global_step=0)
+                    plt.close(fig_sc)
+
+            writer.flush(); writer.close()
+        except Exception as e:
+            print(f"[selection] TensorBoard logging error: {e}")
+
+    # W&B
+    if getattr(args, 'use_wandb', False) and getattr(args, 'log_selection', True):
+        try:
+            import wandb
+            project = os.environ.get('WANDB_PROJECT') or getattr(args, 'proj_name', 'PiFi')
+            entity = os.environ.get('WANDB_ENTITY')
+            name = f"SELECTION - {args.task}/{args.task_dataset} - {args.model_type}/{args.llm_model}"
+            init_kwargs = dict(project=project, name=name, config=dict(
+                task=args.task, dataset=args.task_dataset,
+                slm=args.model_type, llm=args.llm_model,
+                n_samples=n_samples, n_pcs=n_pcs, top_pc=top_pc,
+                seed=getattr(args, 'seed', 0)
+            ), settings=wandb.Settings(save_code=False))
+            if entity:
+                init_kwargs['entity'] = entity
+            run = wandb.init(**init_kwargs)
+
+            # Log table of effects
+            tbl = wandb.Table(data=[[int(i), float(v)] for i, v in enumerate(effects)], columns=['layer', 'effect'])
+            wandb.log({'selection/effects_table': tbl})
+
+            # Plot images if available
+            imgs = []
+            if plt is not None:
+                # line
+                fig_line, ax = plt.subplots(figsize=(8, 2.5))
+                ax.plot(list(range(len(effects))), effects, marker='o')
+                ax.axvline(best_llm_layer, color='r', linestyle='--', label=f'best={best_llm_layer}')
+                ax.set_title('ILM Effect per Layer (line)')
+                ax.set_xlabel('Layer'); ax.set_ylabel('Effect'); ax.legend(loc='upper right')
+                fig_line.tight_layout()
+                imgs.append(wandb.Image(fig_line, caption='effects_line'))
+                plt.close(fig_line)
+            if plt is not None and sns is not None:
+                fig_hm, ax = plt.subplots(figsize=(10, 2.0))
+                sns.heatmap([effects], cmap='viridis', cbar=True, xticklabels=list(range(len(effects))), yticklabels=['effect'], ax=ax)
+                ax.axvline(best_llm_layer + 0.5, color='r', linestyle='--')
+                ax.set_title('ILM Effect per Layer (heatmap)')
+                fig_hm.tight_layout()
+                imgs.append(wandb.Image(fig_hm, caption='effect_heatmap'))
+                plt.close(fig_hm)
+            # Correlation heatmap image
+            if corr_mat is not None and plt is not None and sns is not None:
+                fig_corr, ax = plt.subplots(figsize=(max(6, n_pcs/2), max(3, corr_mat.shape[0]/4)))
+                sns.heatmap(corr_mat, cmap='magma', cbar=True,
+                            xticklabels=list(range(n_pcs)),
+                            yticklabels=list(range(corr_mat.shape[0])), ax=ax)
+                ax.set_title('ILM Layer x PC Label-Correlation')
+                ax.set_xlabel('PC'); ax.set_ylabel('Layer')
+                fig_corr.tight_layout()
+                imgs.append(wandb.Image(fig_corr, caption='corr_heatmap'))
+                plt.close(fig_corr)
+
+            # PCA scatter plots for selected layers
+            if getattr(args, 'log_selection_pca', True) and hidden_per_layer is not None and labels is not None and plt is not None:
+                sel_layers = _select_plot_layers(len(hidden_per_layer), best_llm_layer,
+                                                 getattr(args, 'selection_plot_layers', 'best,first,mid,last'),
+                                                 getattr(args, 'selection_plot_max_layers', 6))
+                for li in sel_layers:
+                    X = hidden_per_layer[li]
+                    pcs = min(2, X.shape[0], X.shape[1])
+                    if pcs < 2:
+                        continue
+                    S2, _ = _pca_scores(X, n_components=2)
+                    fig_sc, ax = plt.subplots(figsize=(4, 3))
+                    labs = np.array(labels)
+                    uniq = np.unique(labs)
+                    for c in uniq:
+                        idx = labs == c
+                        ax.scatter(S2[idx, 0], S2[idx, 1], s=8, alpha=0.7, label=str(int(c)))
+                    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+                    ax.set_title(f'PCA Scatter - Layer {li}')
+                    ax.legend(markerscale=2, fontsize=7, loc='best', frameon=False)
+                    fig_sc.tight_layout()
+                    imgs.append(wandb.Image(fig_sc, caption=f'pca_scatter_layer_{li}'))
+                    plt.close(fig_sc)
+
+            if imgs:
+                wandb.log({'selection/plots': imgs})
+
+            # Attach selection.json as artifact
+            try:
+                art = wandb.Artifact(f"selection_{args.task}_{args.task_dataset}_{args.model_type}_{args.llm_model}", type='selection')
+                art.add_file(out_path)
+                run.log_artifact(art)
+            except Exception as e2:
+                print(f"[selection] W&B artifact error: {e2}")
+
+            run.finish()
+        except Exception as e:
+            print(f"[selection] W&B logging error: {e}")
+
+
+def _save_selection_plots(args, effects: List[float], best_llm_layer: int, corr_mat: Optional[np.ndarray] = None,
+                          hidden_per_layer: Optional[List[np.ndarray]] = None, labels: Optional[np.ndarray] = None) -> None:
+    """Save selection plots as images under .archive for quick sharing."""
+    if plt is None:
+        return
+    base = os.path.join('.archive', 'selection_plots', args.task, args.task_dataset, args.model_type, args.llm_model)
+    os.makedirs(base, exist_ok=True)
+    ts = ''  # could add timestamp if desired
+
+    # Line plot
+    fig_line, ax = plt.subplots(figsize=(8, 2.5))
+    ax.plot(list(range(len(effects))), effects, marker='o')
+    ax.axvline(best_llm_layer, color='r', linestyle='--', label=f'best={best_llm_layer}')
+    ax.set_title('ILM Effect per Layer (line)')
+    ax.set_xlabel('Layer'); ax.set_ylabel('Effect'); ax.legend(loc='upper right')
+    fig_line.tight_layout()
+    path_line = os.path.join(base, f'effect_line{ts}.png')
+    fig_line.savefig(path_line, dpi=150)
+    plt.close(fig_line)
+
+    # Heatmap of effects
+    if sns is not None:
+        fig_hm, ax = plt.subplots(figsize=(10, 2.0))
+        sns.heatmap([effects], cmap='viridis', cbar=True, xticklabels=list(range(len(effects))), yticklabels=['effect'], ax=ax)
+        ax.axvline(best_llm_layer + 0.5, color='r', linestyle='--')
+        ax.set_title('ILM Effect per Layer (heatmap)')
+        fig_hm.tight_layout()
+        path_hm = os.path.join(base, f'effect_heatmap{ts}.png')
+        fig_hm.savefig(path_hm, dpi=150)
+        plt.close(fig_hm)
+
+    # Correlation heatmap (layers x PCs)
+    if corr_mat is not None and sns is not None:
+        fig_corr, ax = plt.subplots(figsize=(max(6, corr_mat.shape[1]/2), max(3, corr_mat.shape[0]/4)))
+        sns.heatmap(corr_mat, cmap='magma', cbar=True,
+                    xticklabels=list(range(corr_mat.shape[1])),
+                    yticklabels=list(range(corr_mat.shape[0])), ax=ax)
+        ax.set_title('ILM Layer x PC Label-Correlation')
+        ax.set_xlabel('PC'); ax.set_ylabel('Layer')
+        fig_corr.tight_layout()
+        path_corr = os.path.join(base, f'corr_heatmap{ts}.png')
+        fig_corr.savefig(path_corr, dpi=150)
+        plt.close(fig_corr)
+
+    # PCA scatter plots for selected layers
+    if getattr(args, 'log_selection_pca', True) and hidden_per_layer is not None and labels is not None and plt is not None:
+        sel_layers = _select_plot_layers(len(hidden_per_layer), best_llm_layer,
+                                         getattr(args, 'selection_plot_layers', 'best,first,mid,last'),
+                                         getattr(args, 'selection_plot_max_layers', 6))
+        for li in sel_layers:
+            X = hidden_per_layer[li]
+            pcs = min(2, X.shape[0], X.shape[1])
+            if pcs < 2:
+                continue
+            S2, _ = _pca_scores(X, n_components=2)
+            fig_sc, ax = plt.subplots(figsize=(4, 3))
+            labs = np.array(labels)
+            uniq = np.unique(labs)
+            for c in uniq:
+                idx = labs == c
+                ax.scatter(S2[idx, 0], S2[idx, 1], s=8, alpha=0.7, label=str(int(c)))
+            ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
+            ax.set_title(f'PCA Scatter - Layer {li}')
+            ax.legend(markerscale=2, fontsize=7, loc='best', frameon=False)
+            fig_sc.tight_layout()
+            path_sc = os.path.join(base, f'pca_scatter_layer_{li}{ts}.png')
+            fig_sc.savefig(path_sc, dpi=150)
+            plt.close(fig_sc)
+
+
+def _select_plot_layers(n_layers: int, best: int, spec: str, max_layers: int) -> List[int]:
+    """Resolve which layers to plot based on spec string."""
+    if not spec:
+        spec = 'best,first,mid,last'
+    if spec.strip().lower() == 'all':
+        idxs = list(range(n_layers))
+    else:
+        idxs = []
+        tokens = [t.strip().lower() for t in spec.split(',') if t.strip()]
+        for t in tokens:
+            if t == 'best' and 0 <= best < n_layers:
+                idxs.append(best)
+            elif t == 'first':
+                idxs.append(0)
+            elif t == 'last':
+                idxs.append(n_layers-1)
+            elif t == 'mid':
+                idxs.append(max(0, n_layers//2))
+            else:
+                try:
+                    v = int(t)
+                    if 0 <= v < n_layers:
+                        idxs.append(v)
+                except Exception:
+                    pass
+    # unique and cap
+    uniq = []
+    for v in idxs:
+        if v not in uniq:
+            uniq.append(v)
+    return uniq[:max(1, max_layers)]

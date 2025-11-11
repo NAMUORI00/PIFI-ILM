@@ -252,6 +252,7 @@ for DS in ${DATASETS}; do
                 --selection_pooling mean
                 --selection_dtype fp16
                 --selection_max_length 128
+                --log_selection "${LOG_SELECTION:-true}"
             )
         fi
 

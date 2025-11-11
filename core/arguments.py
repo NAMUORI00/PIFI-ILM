@@ -191,6 +191,14 @@ class ArgParser():
                                  help='Using tensorboard; Default is True')
         self.parser.add_argument('--use_wandb', type=parse_bool, default=True,
                                  help='Using wandb; Default is True')
+        self.parser.add_argument('--log_selection', type=parse_bool, default=True,
+                                 help='Log ILM selection to TensorBoard/W&B when enabled; Default is True')
+        self.parser.add_argument('--log_selection_pca', type=parse_bool, default=True,
+                                 help='Log per-layer PCA scatter plots during ILM selection; Default is True')
+        self.parser.add_argument('--selection_plot_layers', type=str, default='best,first,mid,last',
+                                 help='Layers to plot PCA scatter: comma list (e.g., "best,first,last,3,7") or "all"; Default best,first,mid,last')
+        self.parser.add_argument('--selection_plot_max_layers', type=int, default=6,
+                                 help='Max number of layers to plot PCA scatter; Default is 6')
         self.parser.add_argument('--log_freq', default=500, type=int,
                                  help='Logging frequency; Default is 500')
 
