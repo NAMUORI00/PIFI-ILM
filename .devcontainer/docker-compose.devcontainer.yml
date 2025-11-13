@@ -2,10 +2,7 @@ version: "3.9"
 
 services:
   pifi:
+    # Dev Containers will set HOME and mount /home/dev via devcontainer.json mounts.
+    # Keep this override minimal to avoid conflicting mounts.
     environment:
-      HOME: /home/dev
       FIRST_RUN: "false"
-      HF_HOME: /app/cache/hf
-    volumes:
-      - ../.devhome:/home/dev
-

@@ -7,6 +7,8 @@
   "service": "pifi",
   "workspaceFolder": "/app",
   "overrideCommand": false,
+  "remoteUser": "dev",
+  "updateRemoteUserUID": true,
 
   "containerEnv": {
     "FIRST_RUN": "false",
@@ -33,4 +35,3 @@
     }
   }
 }
-
