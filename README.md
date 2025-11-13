@@ -136,6 +136,23 @@ docker compose up -d pifi
 docker compose exec pifi bash
 ```
 
+First-run auto experiment (classification + ILM):
+```bash
+# The container entrypoint will automatically run a quick classification + ILM run on first start
+# (defaults: DATASETS=sst2, MODEL=bert, LLM=llama3.1, EPOCHS=1, BS=8, USE_WANDB=false, USE_TENSORBOARD=false)
+# A marker is written to results/.first_run_done to avoid re-running next time.
+
+docker compose down
+rm -f results/.first_run_done  # optional: force re-run
+docker compose up -d pifi
+
+# watch logs
+docker compose logs -f pifi
+
+# to skip auto-run
+FIRST_RUN=false docker compose up -d pifi
+```
+
 Compose quick test flow (GPU + HF cache path set):
 ```bash
 # 0) GPU check
@@ -162,7 +179,8 @@ docker compose down
 
 Notes:
 - Some Docker/Compose versions may ignore GPU reservations; if so, use `docker compose run --gpus all ...` or the `up`+`exec` sequence above.
-- If cache permission issues occur under `/opt/hf-cache`, set `HF_HOME=/app/cache/hf` as shown (host-mapped `cache/`).
+- The entrypoint sets `HF_HOME=/app/cache/hf` (and `TRANSFORMERS_CACHE`/`HF_DATASETS_CACHE`) to avoid cache permission issues.
+- You can override first-run parameters via env vars on `up`: `DATASETS`, `MODEL`, `LLM`, `EPOCHS`, `BS`, `WORKERS`, `USE_WANDB`, `USE_TENSORBOARD`.
 
 ### Classification Tasks
 

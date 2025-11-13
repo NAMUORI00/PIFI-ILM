@@ -32,5 +32,8 @@ RUN mkdir -p /opt/hf-cache /app/cache /app/preprocessed /app/models /app/checkpo
 ENV PYTHONPATH=/app \
     ROOT_DIR=/app
 
-# Minimal default command; users run their own commands
-CMD ["bash"]
+# Entrypoint: run first-run ILM classification, then exec CMD
+COPY docker/entrypoint.sh /usr/local/bin/pifi-entrypoint
+RUN chmod +x /usr/local/bin/pifi-entrypoint
+ENTRYPOINT ["/usr/local/bin/pifi-entrypoint"]
+CMD ["bash", "-lc", "tail -f /dev/null"]
