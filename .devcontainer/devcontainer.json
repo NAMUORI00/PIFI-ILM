@@ -1,0 +1,36 @@
+{
+  "name": "PiFi Dev",
+  "dockerComposeFile": [
+    "../docker-compose.yml",
+    "docker-compose.devcontainer.yml"
+  ],
+  "service": "pifi",
+  "workspaceFolder": "/app",
+  "overrideCommand": false,
+
+  "containerEnv": {
+    "FIRST_RUN": "false",
+    "HOME": "/home/dev",
+    "HF_HOME": "/app/cache/hf",
+    "WANDB_MODE": "offline",
+    "MPLCONFIGDIR": "/app/cache/mpl"
+  },
+
+  "mounts": [
+    "type=bind,source=${localWorkspaceFolder},target=/app",
+    "type=bind,source=${localWorkspaceFolder}/.devhome,target=/home/dev"
+  ],
+
+  "postCreateCommand": "mkdir -p /app/cache/mpl",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}
+
