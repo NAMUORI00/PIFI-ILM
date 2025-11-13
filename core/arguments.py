@@ -20,7 +20,11 @@ def parse_bool(value: str):
 class ArgParser():
     def __init__(self):
         self.parser = argparse.ArgumentParser(description='PiFi: Plug-in and Fine-tuning')
-        self.user_name = os.getlogin()
+        try:
+            self.user_name = os.getlogin()
+        except OSError:
+            # Fallback in containerized/daemonized environments with no controlling TTY
+            self.user_name = os.environ.get('USER') or os.environ.get('USERNAME') or 'user'
 
         # Task arguments
         task_list = ['classification', 'entailment']
@@ -53,20 +57,37 @@ class ArgParser():
         self.parser.add_argument('--method', type=str, choices=method_list, default='pifi',
                                  help='Method to use; Default is "pifi"')
 
-        # Path arguments - Modify these paths to fit your environment
-        self.parser.add_argument('--data_path', type=str, default=f'/nas_homes/{self.user_name}/dataset/',
+        # Path arguments
+        # Defaults prefer container-friendly root-path layout when running in Docker
+        # and fall back to legacy user home layout on bare metal. All can be overridden
+        # by environment variables: PIFI_*_PATH.
+        is_docker = os.path.exists('/.dockerenv') or os.environ.get('PIFI_IN_DOCKER') == '1'
+        default_root = '/app' if is_docker else f'/nas_homes/{self.user_name}'
+
+        def _env_or(key: str, default: str) -> str:
+            return os.environ.get(key, default)
+
+        data_path_def = _env_or('PIFI_DATA_PATH', f'{default_root}/dataset' + ('/' if not default_root.endswith('/') else ''))
+        cache_path_def = _env_or('PIFI_CACHE_PATH', f'{default_root}/cache' if is_docker else f'/nas_homes/{self.user_name}/model')
+        preprocess_path_def = _env_or('PIFI_PREPROCESS_PATH', f'{default_root}/preprocessed' if is_docker else f'/nas_homes/{self.user_name}/preprocessed/PiFi')
+        model_path_def = _env_or('PIFI_MODEL_PATH', f'{default_root}/models' if is_docker else f'/nas_homes/{self.user_name}/model_final/PiFi')
+        checkpoint_path_def = _env_or('PIFI_CHECKPOINT_PATH', f'{default_root}/checkpoints' if is_docker else f'/nas_homes/{self.user_name}/model_checkpoint/PiFi')
+        result_path_def = _env_or('PIFI_RESULT_PATH', f'{default_root}/results' if is_docker else f'/nas_homes/{self.user_name}/results/PiFi')
+        log_path_def = _env_or('PIFI_LOG_PATH', f'{default_root}/tensorboard_logs' if is_docker else f'/nas_homes/{self.user_name}/tensorboard_log/PiFi')
+
+        self.parser.add_argument('--data_path', type=str, default=data_path_def,
                                  help='Path to the raw dataset before preprocessing')
-        self.parser.add_argument('--cache_path', type=str, default=f'/nas_homes/{self.user_name}/model',
+        self.parser.add_argument('--cache_path', type=str, default=cache_path_def,
                                  help='Path to the cache file.')
-        self.parser.add_argument('--preprocess_path', type=str, default=f'/nas_homes/{self.user_name}/preprocessed/PiFi',
+        self.parser.add_argument('--preprocess_path', type=str, default=preprocess_path_def,
                                  help='Path to the preprocessed dataset.')
-        self.parser.add_argument('--model_path', type=str, default=f'/nas_homes/{self.user_name}/model_final/PiFi',
+        self.parser.add_argument('--model_path', type=str, default=model_path_def,
                                  help='Path to the model after training.')
-        self.parser.add_argument('--checkpoint_path', type=str, default=f'/nas_homes/{self.user_name}/model_checkpoint/PiFi',
+        self.parser.add_argument('--checkpoint_path', type=str, default=checkpoint_path_def,
                                  help='Path to model checkpoints during training.')
-        self.parser.add_argument('--result_path', type=str, default=f'/nas_homes/{self.user_name}/results/PiFi',
+        self.parser.add_argument('--result_path', type=str, default=result_path_def,
                                  help='Path to the result after testing.')
-        self.parser.add_argument('--log_path', type=str, default=f'/nas_homes/{self.user_name}/tensorboard_log/PiFi',
+        self.parser.add_argument('--log_path', type=str, default=log_path_def,
                                  help='Path to the tensorboard log file.')
 
         # Model - Basic arguments

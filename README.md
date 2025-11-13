@@ -91,6 +91,79 @@ python main.py --task classification --job training --task_dataset sst2 \
     --method pifi --llm_model llama3.1 --auto_select_layer true
 ```
 
+## Docker (GPU)
+
+This repository includes a Dockerfile and optional docker-compose for convenience.
+
+Build the image:
+```bash
+docker build -t pifi:cu118 .
+```
+
+Interactive shell with mounted artifacts:
+```bash
+docker run --rm -it --gpus all \
+  -v $PWD/cache:/app/cache \
+  -v $PWD/preprocessed:/app/preprocessed \
+  -v $PWD/models:/app/models \
+  -v $PWD/checkpoints:/app/checkpoints \
+  -v $PWD/results:/app/results \
+  -v $PWD/tensorboard_logs:/app/tensorboard_logs \
+  -v $PWD/wandb:/app/wandb \
+  -v $PWD/.hf_cache:/opt/hf-cache \
+  -v $PWD/dataset:/app/dataset \
+  -w /app \
+  pifi:cu118 bash
+```
+
+One-shot training example:
+```bash
+docker run --rm --gpus all \
+  -v $PWD/cache:/app/cache -v $PWD/preprocessed:/app/preprocessed \
+  -v $PWD/models:/app/models -v $PWD/checkpoints:/app/checkpoints \
+  -v $PWD/results:/app/results -v $PWD/tensorboard_logs:/app/tensorboard_logs \
+  -w /app --entrypoint python pifi:cu118 \
+  main.py --task classification --job training --task_dataset sst2 --method base
+```
+
+### Docker Compose (optional)
+
+Build and keep container running, then exec commands:
+```bash
+docker compose build
+docker compose up -d pifi
+# shell inside container
+docker compose exec pifi bash
+```
+
+Compose quick test flow (GPU + HF cache path set):
+```bash
+# 0) GPU check
+docker compose exec pifi python -c "import torch; print('CUDA', torch.cuda.is_available()); print('GPU', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+
+# 1) Preprocess (sst2)
+docker compose exec -e HF_HOME=/app/cache/hf \
+  pifi python main.py --task classification --job preprocessing --task_dataset sst2 \
+  --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64 --train_valid_split 0.95
+
+# 2) Train base (1 epoch)
+docker compose exec -e HF_HOME=/app/cache/hf \
+  pifi python main.py --task classification --job training --task_dataset sst2 --method base \
+  --num_epochs 1 --batch_size 16 --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64
+
+# 3) Test
+docker compose exec -e HF_HOME=/app/cache/hf \
+  pifi python main.py --task classification --job testing --task_dataset sst2 --method base \
+  --batch_size 32 --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64
+
+# 4) Stop services
+docker compose down
+```
+
+Notes:
+- Some Docker/Compose versions may ignore GPU reservations; if so, use `docker compose run --gpus all ...` or the `up`+`exec` sequence above.
+- If cache permission issues occur under `/opt/hf-cache`, set `HF_HOME=/app/cache/hf` as shown (host-mapped `cache/`).
+
 ### Classification Tasks
 
 The classification module supports multiple datasets: SST-2, IMDB, Tweet Sentiment Binary, Tweet Offensive, and CoLA.

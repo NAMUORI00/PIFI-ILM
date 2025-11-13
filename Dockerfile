@@ -1,0 +1,36 @@
+# PiFi Dockerfile (CUDA 11.8)
+# Base on PyTorch runtime to avoid re-downloading CUDA wheels
+FROM pytorch/pytorch:2.2.2-cuda11.8-cudnn8-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/opt/hf-cache \
+    WANDB_MODE=offline
+
+WORKDIR /app
+
+# System deps (git for HF, make for convenience)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates make && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies first for better layer caching
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install -r /app/requirements.txt
+
+# Copy the rest of the project
+COPY . /app
+
+# Create cache/artifact directories with write permissions
+RUN mkdir -p /opt/hf-cache /app/cache /app/preprocessed /app/models /app/checkpoints /app/results /app/tensorboard_logs && \
+    chmod -R 777 /opt/hf-cache /app/cache /app/preprocessed /app/models /app/checkpoints /app/results /app/tensorboard_logs
+
+# Ensure project is importable and set default root
+ENV PYTHONPATH=/app \
+    ROOT_DIR=/app
+
+# Minimal default command; users run their own commands
+CMD ["bash"]

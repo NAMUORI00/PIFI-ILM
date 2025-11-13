@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  pifi:
+    build: .
+    image: pifi:cu118
+    working_dir: /app
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      WANDB_MODE: ${WANDB_MODE:-offline}
+    volumes:
+      - ./cache:/app/cache
+      - ./preprocessed:/app/preprocessed
+      - ./models:/app/models
+      - ./checkpoints:/app/checkpoints
+      - ./results:/app/results
+      - ./tensorboard_logs:/app/tensorboard_logs
+      - ./wandb:/app/wandb
+      - ./.hf_cache:/opt/hf-cache
+      - ./dataset:/app/dataset
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    command: ["bash","-lc","tail -f /dev/null"]

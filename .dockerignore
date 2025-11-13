@@ -1,0 +1,29 @@
+# VCS
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv
+env
+
+# Local artifacts (avoid bloating build context)
+cache
+preprocessed
+models
+checkpoints
+results
+tensorboard_logs
+wandb
+.hf_cache
+.archive
+
+# OS
+.DS_Store
+Thumbs.db
+
