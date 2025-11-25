@@ -13,7 +13,9 @@ wandb/
 runs/
 outputs/
 checkpoints/
+checkpoints_user/
 logs/
+tensorboard_logs_user/
 **/checkpoints/
 **/logs/
 **/tensorboard_logs/
@@ -23,17 +25,20 @@ data/
 cache/
 preprocessed/
 models/
+models_user/
 results/
+results_user/
 results/layer_selection/
 **/cache/
 **/preprocessed/
 **/models/
 **/results/
+.hf_cache/
 .archive/
 .env
-.archive/
 Classification/preprocessed/
 TextualEntailment/preprocessed/
+dataset/
 
 # Generated files
 *.pt
