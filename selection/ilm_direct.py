@@ -7,7 +7,7 @@ import torch
 from transformers import AutoTokenizer, AutoModel, AutoConfig
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, silhouette_score
 try:
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -20,7 +20,8 @@ except Exception:
     SummaryWriter = None
 
 
-def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation') -> Tuple[List[str], List[int]]:
+def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation',
+                     stratified: bool = False) -> Tuple[List[str], List[int]]:
     from datasets import load_dataset
 
     rng = np.random.default_rng(seed)
@@ -32,11 +33,31 @@ def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, sp
     def take_subset(ds, text_key: str, label_key: str):
         nonlocal texts, labels
         n = min(n_samples, len(ds))
-        idx = rng.choice(len(ds), size=n, replace=False)
-        for i in idx:
-            item = ds[int(i)]
-            texts.append(str(item[text_key]))
-            labels.append(int(item[label_key]))
+        if stratified:
+            # balanced per-class sampling
+            # build indices per class
+            per_class = {}
+            for i in range(len(ds)):
+                item = ds[int(i)]
+                c = int(item[label_key])
+                per_class.setdefault(c, []).append(i)
+            if len(per_class) == 0:
+                return
+            k = len(per_class)
+            per_cls_n = max(1, n // k)
+            for c, arr in per_class.items():
+                take = min(per_cls_n, len(arr))
+                idx = rng.choice(arr, size=take, replace=False)
+                for j in idx:
+                    item = ds[int(j)]
+                    texts.append(str(item[text_key]))
+                    labels.append(int(item[label_key]))
+        else:
+            idx = rng.choice(len(ds), size=n, replace=False)
+            for i in idx:
+                item = ds[int(i)]
+                texts.append(str(item[text_key]))
+                labels.append(int(item[label_key]))
 
     if name == "sst2":
         # Prefer SetFit/sst2; fallback to GLUE sst2 with proper text key
@@ -109,7 +130,9 @@ def _pool_hidden(hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -
 
 
 @torch.no_grad()
-def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", max_length: int = 128, batch_size: int = 16, dtype: Optional[torch.dtype] = None, pooling: str = 'first') -> List[np.ndarray]:
+def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", max_length: int = 128,
+                           batch_size: int = 16, dtype: Optional[torch.dtype] = None, pooling: str = 'first',
+                           l2_norm: bool = True) -> List[np.ndarray]:
     tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
     model = AutoModel.from_pretrained(llm_id)
     if device == "cuda" and torch.cuda.is_available():
@@ -142,6 +165,9 @@ def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", 
             else:
                 pooled = _pool_hidden(h, enc.get("attention_mask"))
             pooled_np = pooled.detach().float().cpu().numpy()
+            if l2_norm:
+                norm = np.linalg.norm(pooled_np, axis=1, keepdims=True)
+                pooled_np = pooled_np / np.maximum(norm, 1e-8)
             all_layers[li] = np.vstack([all_layers[li], pooled_np])
     return all_layers
 
@@ -204,6 +230,97 @@ def _ilm_effect_for_layer(X: np.ndarray, y: np.ndarray, n_pcs: int, top_pc: int,
     return best
 
 
+def _fisher_class_separation(X: np.ndarray, y: np.ndarray) -> float:
+    """Class separation score: inter-centroid distance / intra-class variance."""
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y)
+    classes = np.unique(y)
+    if len(classes) < 2 or X.shape[0] == 0:
+        return 0.0
+    centroids = {}
+    within = 0.0
+    for c in classes:
+        Xc = X[y == c]
+        if len(Xc) == 0:
+            continue
+        mu = Xc.mean(axis=0)
+        centroids[c] = mu
+        var = ((Xc - mu) ** 2).sum(axis=1).mean()
+        within += float(var)
+    within = max(within, 1e-6)
+    if len(centroids) < 2:
+        return 0.0
+    # inter-class: mean pairwise centroid distance^2
+    inter_dists = []
+    c_list = list(centroids.keys())
+    for i in range(len(c_list)):
+        for j in range(i + 1, len(c_list)):
+            inter_dists.append(float(np.linalg.norm(centroids[c_list[i]] - centroids[c_list[j]]) ** 2))
+    if len(inter_dists) == 0:
+        return 0.0
+    inter = float(np.mean(inter_dists))
+    return inter / within
+
+
+def _logit_probe_score(X: np.ndarray, y: np.ndarray, seed: int = 0) -> float:
+    """Lightweight linear probe accuracy as a proxy for downstream performance."""
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y)
+    classes = np.unique(y)
+    if len(classes) < 2 or X.shape[0] < 10:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    train_idx = []
+    val_idx = []
+    for c in classes:
+        idx = np.where(y == c)[0]
+        if len(idx) == 0:
+            continue
+        rng.shuffle(idx)
+        cut = max(1, int(0.8 * len(idx)))
+        train_idx.extend(idx[:cut])
+        val_idx.extend(idx[cut:])
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        return 0.0
+    clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class='auto')
+    clf.fit(X[train_idx], y[train_idx])
+    acc = accuracy_score(y[val_idx], clf.predict(X[val_idx]))
+    return float(acc)
+
+
+def _rerank_topk(candidates: List[int], scores: List[float]) -> int:
+    """Return best layer from candidates using provided scores."""
+    best_idx = int(np.argmax(scores))
+    return int(candidates[best_idx])
+
+
+def _compute_score_for_layer(X: np.ndarray, y: np.ndarray, mode: str, alpha: float, seed: int) -> float:
+    """Unified scoring: probe / fisher / silhouette / mixed."""
+    mode = (mode or "probe").lower()
+    probe = _logit_probe_score(X, y, seed=seed)
+    sil = 0.0
+    try:
+        sil = float(silhouette_score(X, y)) if len(np.unique(y)) > 1 and X.shape[0] > len(np.unique(y)) else 0.0
+    except Exception:
+        sil = 0.0
+    if mode == "probe":
+        return probe
+    fisher = _fisher_class_separation(X, y)
+    if mode == "fisher":
+        return fisher
+    if mode == "silhouette":
+        return sil
+    # mixed: combine probe, fisher, silhouette
+    alpha = float(alpha)
+    beta = float(getattr(_compute_score_for_layer, "_beta", 0.3))
+    gamma = float(getattr(_compute_score_for_layer, "_gamma", 0.3))
+    total = alpha + beta + gamma
+    if total <= 0:
+        return probe
+    alpha /= total; beta /= total; gamma /= total
+    return alpha * probe + beta * fisher + gamma * sil
+
+
 def auto_select_layer(args) -> int:
     """Direct ILM-style selection on LLM layers.
     Returns best_llm_layer index (0-based). Saves selection.json with effects.
@@ -230,17 +347,24 @@ def auto_select_layer(args) -> int:
 
     stride = int(getattr(args, "selection_layer_stride", 1))
     split = getattr(args, "selection_split", 'validation')
-    pooling = getattr(args, "selection_pooling", 'first')
+    pooling = getattr(args, "selection_pooling", 'mean')
     # max_length: use selection_max_length >0 else fall back to args.max_seq_len if present else 128
     sel_max_len = int(getattr(args, "selection_max_length", 0) or getattr(args, "max_seq_len", 128) or 128)
     dtype_pref = getattr(args, "selection_dtype", 'fp32')
+    stratified = str(getattr(args, "selection_stratified", True)).lower() == "true"
+    score_mode = getattr(args, "selection_score_mode", "mixed")
+    score_alpha = float(getattr(args, "selection_score_alpha", 0.4))
+    score_beta = float(getattr(args, "selection_score_beta", 0.3))  # fisher
+    score_gamma = float(getattr(args, "selection_score_gamma", 0.3))  # silhouette
+    _compute_score_for_layer._beta = score_beta
+    _compute_score_for_layer._gamma = score_gamma
 
     # Resolve huggingface model id for LLM
     from core.utils import get_huggingface_model_name
     llm_id = get_huggingface_model_name(llm_type)
 
     # Collect data
-    texts, labels = _resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split)
+    texts, labels = _resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=stratified)
     if len(texts) < 10:
         print("[selection] Not enough samples; defaulting to mid layer")
         cfg = AutoConfig.from_pretrained(llm_id)
@@ -249,22 +373,33 @@ def auto_select_layer(args) -> int:
     # Collect pooled hidden per layer for LLM
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if (dtype_pref == 'fp16' and device == 'cuda') else torch.float32
-    hidden_per_layer = _get_llm_hidden_layers(llm_id, texts, device=device, max_length=sel_max_len, batch_size=16, dtype=dtype, pooling=pooling)
+    hidden_per_layer = _get_llm_hidden_layers(llm_id, texts, device=device, max_length=sel_max_len, batch_size=16, dtype=dtype, pooling=pooling, l2_norm=True)
     y = np.array(labels)
 
+    depth_bias = float(getattr(args, "selection_depth_bias", 0.3))
+    num_layers = len(hidden_per_layer)
+
+    # 1st stage: coarse scoring (logit probe)
     effects: List[float] = []
     for Li, X in enumerate(hidden_per_layer):
         if stride > 1 and (Li % stride != 0):
             effects.append(0.0)
             continue
         try:
-            eff = _ilm_effect_for_layer(X, y, n_pcs=n_pcs, top_pc=top_pc, lambdas=lambdas)
+            eff = _compute_score_for_layer(X, y, mode=score_mode, alpha=score_alpha, seed=seed)
         except Exception as e:
             print(f"[selection] LLM layer {Li} scoring failed: {e}; using 0")
             eff = 0.0
-        effects.append(eff)
+        # depth prior: slightly favor shallower layers
+        depth_weight = 1.0 - depth_bias * (Li / max(1, num_layers - 1))
+        effects.append(eff * depth_weight)
 
-    best_llm_layer = int(np.argmax(np.array(effects)))
+    # Top-k rerank with same score (lightweight)
+    k = int(getattr(args, "selection_topk_rerank", 3))
+    eff_np = np.array(effects)
+    top_idx = np.argsort(-eff_np)[:max(1, k)]
+    top_scores = eff_np[top_idx]
+    best_llm_layer = _rerank_topk(list(top_idx), list(top_scores))
 
     # Compute layer x PC correlation matrix for visualization (no extra forward pass)
     corr_mat = None
