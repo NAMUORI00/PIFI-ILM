@@ -226,6 +226,8 @@ class ArgParser():
                                  help='Layers to plot PCA scatter: comma list (e.g., "best,first,last,3,7") or "all"; Default best,first,mid,last')
         self.parser.add_argument('--selection_plot_max_layers', type=int, default=6,
                                  help='Max number of layers to plot PCA scatter; Default is 6')
+        self.parser.add_argument('--save_selection_plots', type=parse_bool, default=False,
+                                 help='Save ILM selection plots to disk (result_path/selection_plots/); Default is False')
         self.parser.add_argument('--log_freq', default=500, type=int,
                                  help='Logging frequency; Default is 500')
 

@@ -445,12 +445,13 @@ def auto_select_layer(args) -> int:
     except Exception as e:
         print(f"[selection] Logging failed (non-fatal): {e}")
 
-    # Optional archive images to .archive for quick sharing
-    try:
-        _save_selection_plots(args, effects, best_llm_layer, corr_mat=corr_mat,
-                              hidden_per_layer=hidden_per_layer, labels=y)
-    except Exception as e:
-        print(f"[selection] Archiving plots failed (non-fatal): {e}")
+    # Optional save plots to disk (controlled by --save_selection_plots flag)
+    if getattr(args, 'save_selection_plots', False):
+        try:
+            _save_selection_plots(args, effects, best_llm_layer, corr_mat=corr_mat,
+                                  hidden_per_layer=hidden_per_layer, labels=y)
+        except Exception as e:
+            print(f"[selection] Saving plots failed (non-fatal): {e}")
     return best_llm_layer
 
 
@@ -560,10 +561,11 @@ def _log_selection_results(args,
 
 def _save_selection_plots(args, effects: List[float], best_llm_layer: int, corr_mat: Optional[np.ndarray] = None,
                           hidden_per_layer: Optional[List[np.ndarray]] = None, labels: Optional[np.ndarray] = None) -> None:
-    """Save selection plots as images under .archive for quick sharing."""
+    """Save selection plots as images under result_path/selection_plots/."""
     if plt is None:
         return
-    base = os.path.join('.archive', 'selection_plots', args.task, args.task_dataset, args.model_type, args.llm_model)
+    result_path = getattr(args, 'result_path', 'results')
+    base = os.path.join(result_path, 'selection_plots', args.task, args.task_dataset, args.model_type, args.llm_model)
     os.makedirs(base, exist_ok=True)
     ts = ''  # could add timestamp if desired
 
