@@ -38,6 +38,9 @@
     -   *문제점*: 감성 분석에는 초기 레이어가 유리함에도 불구하고, PCA Patching 방식은 깊은 레이어인 15번을 잘못 선택했습니다.
 -   **Current 결과**: **Layer 0** (Score: 0.50, Best) - `results_user/.../selection.json` 참조.
     -   *개선*: 0번 레이어(Embedding)가 가장 높은 점수를 기록하며 최적 레이어로 선정되었습니다. 이는 감성 분석과 같은 단순 분류 작업에서 LLM의 초기 임베딩이 충분히 강력함을 시사하며, 알고리즘이 이를 정확히 포착했음을 의미합니다.
+-   **Ground Truth (Sweep)**: `results_user/sst2_layer_sweep_extracted.csv` (TensorBoard 로그 추출)
+    -   실제 스윕 결과, **Layer 0**의 정확도는 **90.2%** (초반부 레이어 중 상위권)이며, Layer 15 부근은 성능이 유사하거나 다소 불안정한 경향을 보입니다.
+    -   *특이사항*: SST-2 스윕 로그에는 총 **48개**의 결과가 기록되어 있습니다. 이는 24개 레이어에 대해 2회 반복 실험(Seed 2023, 2024 등)이 수행되었음을 시사합니다. 전반적으로 초기 레이어(0~5)가 안정적인 성능을 보이며, Current 알고리즘의 선택(Layer 0)이 타당함을 뒷받침합니다.
 
 #### **Case 2: CoLA (문법성 판단)**
 -   **Ground Truth**: `results_user/cola_layer_sweep.csv`에 따르면, 실제 성능(Accuracy)은 **Layer 10** (80.38%)에서 가장 높습니다.
@@ -54,7 +57,7 @@
 1.  **층화 추출 (Stratified Sampling)**: 검증 데이터셋(Validation Set)에서 $N$개의 샘플(기본값: 400)을 추출합니다. 클래스 불균형 문제를 방지하기 위해 클래스별 비율을 유지하며 추출합니다.
     - `selection/ilm_direct.py[23:115]` (`_resolve_dataset`)
 2.  **표현 추출 (Representation Extraction)**: LLM의 모든 레이어에서 히든 스테이트(Hidden States)를 추출합니다.
-    - `selection/ilm_direct.py[133:172]` (`_get_llm_hidden_layers`)
+    - `selection/ilm_direct.py[132:172]` (`_get_llm_hidden_layers`)
 3.  **L2 정규화 (L2 Normalization)**: 레이어마다 벡터의 크기(Scale)가 다를 수 있으므로, 거리 기반 지표(Fisher, Silhouette)의 안정성을 위해 모든 표현 벡터를 단위 길이로 정규화합니다.
     - `selection/ilm_direct.py[168:170]` (`pooled_np = pooled_np / np.maximum(norm, 1e-8)`)
 
@@ -62,13 +65,13 @@
 각 레이어 $l$은 세 가지 지표의 가중 합인 **Mixed Score** ($S_{mixed}$)로 평가됩니다:
 
 $$ S_{mixed}(l) = \alpha \cdot S_{probe}(l) + \beta \cdot S_{fisher}(l) + \gamma \cdot S_{sil}(l) $$
-- **Code Reference**: `selection/ilm_direct.py[321]` (`return alpha * probe + beta * fisher + gamma * sil`)
+- **Code Reference**: `selection/ilm_direct.py[297:321]` (`return alpha * probe + beta * fisher + gamma * sil`)
 
 | 지표 (Metric) | 가중치 (기본값) | 설명 | 코드 위치 |
 | :--- | :--- | :--- | :--- |
-| **Logit Probe** ($S_{probe}$) | $\alpha=0.4$ | 해당 레이어의 표현을 입력으로 하는 경량 로지스틱 회귀(Logistic Regression) 분류기의 정확도입니다. 선형 분리 가능성을 직접적으로 측정합니다. | `selection/ilm_direct.py[265:289]` (`_logit_probe_score`) |
-| **Fisher Score** ($S_{fisher}$) | $\beta=0.3$ | 클래스 간 거리(Inter-class distance)와 클래스 내 분산(Intra-class variance)의 비율입니다. 값이 클수록 클래스 간 분리가 잘 되어 있음을 의미합니다. <br> $$ S_{fisher} = \frac{\text{Mean Inter-Class Distance}}{\text{Mean Intra-Class Variance}} $$ | `selection/ilm_direct.py[233:263]` (`_fisher_class_separation`) |
-| **Silhouette Score** ($S_{sil}$) | $\gamma=0.3$ | 데이터가 자신이 속한 클러스터 내에서 얼마나 촘촘하게 모여있는지(Cohesion), 다른 클러스터와는 얼마나 떨어져 있는지(Separation)를 측정합니다. 범위: $[-1, 1]$. | `selection/ilm_direct.py[303]` (`silhouette_score(X, y)`) |
+| **Logit Probe** ($S_{probe}$) | $\alpha=0.4$ | 해당 레이어의 표현을 입력으로 하는 경량 로지스틱 회귀(Logistic Regression) 분류기의 정확도입니다. 선형 분리 가능성을 직접적으로 측정합니다. | `selection/ilm_direct.py[265:288]` (`_logit_probe_score`) |
+| **Fisher Score** ($S_{fisher}$) | $\beta=0.3$ | 클래스 간 거리(Inter-class distance)와 클래스 내 분산(Intra-class variance)의 비율입니다. 값이 클수록 클래스 간 분리가 잘 되어 있음을 의미합니다. <br> $$ S_{fisher} = \frac{\text{Mean Inter-Class Distance}}{\text{Mean Intra-Class Variance}} $$ | `selection/ilm_direct.py[233:262]` (`_fisher_class_separation`) |
+| **Silhouette Score** ($S_{sil}$) | $\gamma=0.3$ | 데이터가 자신이 속한 클러스터 내에서 얼마나 촘촘하게 모여있는지(Cohesion), 다른 클러스터와는 얼마나 떨어져 있는지(Separation)를 측정합니다. 범위: $[-1, 1]$. | `selection/ilm_direct.py[301:305]` (`silhouette_score(X, y)`) |
 
 ### 3.3 깊이 편향 (Depth Bias) 수식
 깊은 레이어 선호 현상을 억제하기 위한 보정 수식입니다:
@@ -77,7 +80,7 @@ $$ S'_{mixed}(l) = S_{mixed}(l) \cdot \left( 1 - \lambda_{depth} \cdot \frac{l}{
 
 - **$\lambda_{depth}$**: 깊이 편향 계수 (기본값: `0.3`).
 - 레이어가 깊어질수록 점수를 일정 비율 감소시켜, 범용적인 의미 정보를 담고 있는 얕거나 중간 깊이의 레이어가 선택될 확률을 높입니다.
-- **Code Reference**: `selection/ilm_direct.py[394-395]`
+- **Code Reference**: `selection/ilm_direct.py[394:395]`
   ```python
   depth_weight = 1.0 - depth_bias * (Li / max(1, num_layers - 1))
   effects.append(eff * depth_weight)
@@ -87,7 +90,7 @@ $$ S'_{mixed}(l) = S_{mixed}(l) \cdot \left( 1 - \lambda_{depth} \cdot \frac{l}{
 최종적으로 보정된 점수 $S'_{mixed}$가 가장 높은 레이어 $L^*$를 선택합니다.
 
 $$ L^* = \operatorname*{argmax}_{l} S'_{mixed}(l) $$
-- **Code Reference**: `selection/ilm_direct.py[402]` (`best_llm_layer = _rerank_topk(...)`)
+- **Code Reference**: `selection/ilm_direct.py[397:403]` (`best_llm_layer = _rerank_topk(...)`)
 
 ## 4. 설정 파라미터 (Configuration Parameters)
 

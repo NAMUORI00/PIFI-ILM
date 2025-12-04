@@ -6,7 +6,7 @@ export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 cd "$ROOT_DIR"
 
 # Ensure artifact directories exist (ignore errors on bind mounts)
-for d in cache preprocessed models checkpoints results tensorboard_logs wandb; do
+for d in cache preprocessed models checkpoints results wandb; do
   mkdir -p "$ROOT_DIR/$d" || true
 done
 
@@ -27,10 +27,9 @@ if [[ "$FIRST_RUN" == "true" && ! -f "$FIRST_MARKER" ]]; then
   export BS=${BS:-8}
   export WORKERS=${WORKERS:-2}
   export USE_WANDB=${USE_WANDB:-false}
-  export USE_TENSORBOARD=${USE_TENSORBOARD:-false}
 
-  if [[ -x "$ROOT_DIR/scripts/run_classification_pifi_ilm.sh" ]]; then
-    bash "$ROOT_DIR/scripts/run_classification_pifi_ilm.sh" || echo "[entrypoint] ILM runner returned non-zero"
+  if [[ -x "$ROOT_DIR/scripts/run_classification.sh" ]]; then
+    MODE=pifi_ilm bash "$ROOT_DIR/scripts/run_classification.sh" || echo "[entrypoint] Classification runner returned non-zero"
   else
     echo "[entrypoint] Fallback to direct main.py call"
     python "$ROOT_DIR/main.py" \
@@ -40,8 +39,7 @@ if [[ "$FIRST_RUN" == "true" && ! -f "$FIRST_MARKER" ]]; then
       --model_path  "$ROOT_DIR/models" \
       --checkpoint_path "$ROOT_DIR/checkpoints" \
       --result_path "$ROOT_DIR/results" \
-      --log_path "$ROOT_DIR/tensorboard_logs" \
-      --use_wandb "$USE_WANDB" --use_tensorboard "$USE_TENSORBOARD" || true
+      --use_wandb "$USE_WANDB" || true
 
     python "$ROOT_DIR/main.py" \
       --task classification --job training --task_dataset "${DATASETS}" --method pifi --llm_model "$LLM" \
@@ -53,8 +51,7 @@ if [[ "$FIRST_RUN" == "true" && ! -f "$FIRST_MARKER" ]]; then
       --model_path  "$ROOT_DIR/models" \
       --checkpoint_path "$ROOT_DIR/checkpoints" \
       --result_path "$ROOT_DIR/results" \
-      --log_path "$ROOT_DIR/tensorboard_logs" \
-      --use_wandb "$USE_WANDB" --use_tensorboard "$USE_TENSORBOARD" || true
+      --use_wandb "$USE_WANDB" || true
   fi
 
   mkdir -p "$(dirname "$FIRST_MARKER")" && date > "$FIRST_MARKER" || true
