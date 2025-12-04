@@ -28,6 +28,36 @@ import argparse
 import warnings
 
 
+def _build_experiment_dir(args: argparse.Namespace, base_dir: str) -> str:
+    """
+    Construct experiment directory path rooted at base_dir.
+    Shared helper for unified and legacy layouts.
+    """
+    path_parts = [
+        base_dir,
+        args.task,
+        args.task_dataset,
+        args.padding,
+        args.model_type,
+        args.method,
+    ]
+
+    if args.method == 'pifi':
+        path_parts.extend([args.llm_model, str(args.layer_num)])
+    else:
+        path_parts.extend(['none', 'none'])
+
+    return os.path.join(*path_parts)
+
+
+def _has_checkpoint_files(directory: str) -> bool:
+    """Check if a directory already contains known checkpoint files."""
+    return (
+        os.path.exists(os.path.join(directory, 'checkpoint.pt')) or
+        os.path.exists(os.path.join(directory, 'last.pt'))
+    )
+
+
 def get_logs_base(args: argparse.Namespace) -> str:
     """
     Get the logs base directory path.
@@ -80,31 +110,17 @@ def get_experiment_dir(args: argparse.Namespace) -> str:
     Returns:
         Full experiment directory path
     """
-    path_parts = [
-        get_logs_base(args),
-        'experiments',
-        args.task,
-        args.task_dataset,
-        args.padding,
-        args.model_type,
-        args.method,
-    ]
-
-    # Add LLM-specific paths for pifi method
-    if args.method == 'pifi':
-        path_parts.extend([args.llm_model, str(args.layer_num)])
-    else:
-        # For non-pifi, use 'none' placeholders for consistent structure
-        path_parts.extend(['none', 'none'])
-
-    return os.path.join(*path_parts)
+    experiments_root = os.path.join(get_logs_base(args), 'experiments')
+    return _build_experiment_dir(args, experiments_root)
 
 
 def get_checkpoint_dir(args: argparse.Namespace) -> str:
     """
     Get checkpoint directory path.
 
-    Structure: {experiment_dir}/checkpoints/
+    Structure: {experiment_dir}/checkpoints/ (unified)
+    If --checkpoint_path is provided, use it as the base (legacy override) and
+    probe both legacy (no trailing /checkpoints) and unified subdirectories.
 
     Args:
         args: Parsed arguments with experiment config
@@ -112,6 +128,19 @@ def get_checkpoint_dir(args: argparse.Namespace) -> str:
     Returns:
         Full checkpoint directory path
     """
+    override_base = getattr(args, 'checkpoint_path', '') or ''
+    if override_base:
+        experiment_dir = _build_experiment_dir(args, override_base)
+        unified_dir = os.path.join(experiment_dir, 'checkpoints')
+
+        if _has_checkpoint_files(unified_dir):
+            return unified_dir
+        if _has_checkpoint_files(experiment_dir):
+            return experiment_dir
+
+        # No checkpoints yet; prefer unified layout under the override base
+        return unified_dir
+
     return os.path.join(get_experiment_dir(args), 'checkpoints')
 
 
@@ -127,7 +156,12 @@ def get_model_path(args: argparse.Namespace) -> str:
     Returns:
         Full path to final_model.pt
     """
-    return os.path.join(get_experiment_dir(args), 'final_model.pt')
+    override_base = getattr(args, 'model_path', '') or ''
+    experiment_dir = (
+        _build_experiment_dir(args, override_base)
+        if override_base else get_experiment_dir(args)
+    )
+    return os.path.join(experiment_dir, 'final_model.pt')
 
 
 # =============================================================================
@@ -154,23 +188,7 @@ def get_experiment_path(base_path: str, args: argparse.Namespace) -> str:
         DeprecationWarning,
         stacklevel=2
     )
-    path_parts = [
-        base_path,
-        args.task,
-        args.task_dataset,
-        args.padding,
-        args.model_type,
-        args.method,
-    ]
-
-    # Add LLM-specific paths for pifi method
-    if args.method == 'pifi':
-        path_parts.extend([args.llm_model, str(args.layer_num)])
-    else:
-        # For non-pifi, use 'none' placeholders for consistent structure
-        path_parts.extend(['none', 'none'])
-
-    return os.path.join(*path_parts)
+    return _build_experiment_dir(args, base_path)
 
 
 def get_checkpoint_path(args: argparse.Namespace) -> str:
@@ -190,4 +208,4 @@ def get_checkpoint_path(args: argparse.Namespace) -> str:
         DeprecationWarning,
         stacklevel=2
     )
-    return get_experiment_path(args.checkpoint_path, args)
+    return _build_experiment_dir(args, args.checkpoint_path)

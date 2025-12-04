@@ -120,7 +120,7 @@ def training(args: argparse.Namespace) -> None:
     if args.use_wandb:
         wandb_mgr = WandbManager.get_instance()
 
-    # Resume training if needed
+    # Auto-resume: check for existing checkpoints
     start_epoch = 0
     checkpoint_dir = get_checkpoint_dir(args)
     resume_wandb_id = None
@@ -128,68 +128,70 @@ def training(args: argparse.Namespace) -> None:
     best_valid_objective_value = None
     early_stopping_counter = 0
 
-    if args.job == 'resume_training':
-        write_log(logger, "Resuming training model")
-        last_checkpoint_file = os.path.join(checkpoint_dir, 'last.pt')
-        best_checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.pt')
-        if os.path.exists(last_checkpoint_file):
-            checkpoint_file = last_checkpoint_file
-            write_log(logger, "Found last.pt, resuming from latest state")
-        elif os.path.exists(best_checkpoint_file):
-            checkpoint_file = best_checkpoint_file
-            write_log(logger, "last.pt not found, falling back to checkpoint.pt (best state)")
+    # Auto-detect checkpoint and resume (works for both 'training' and 'resume_training')
+    last_checkpoint_file = os.path.join(checkpoint_dir, 'last.pt')
+    best_checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.pt')
+    checkpoint_file = None
+
+    if os.path.exists(last_checkpoint_file):
+        checkpoint_file = last_checkpoint_file
+        write_log(logger, "Found last.pt, will resume from latest state")
+    elif os.path.exists(best_checkpoint_file):
+        checkpoint_file = best_checkpoint_file
+        write_log(logger, "Found checkpoint.pt, will resume from best state")
+
+    if checkpoint_file is not None:
+        model = model.to('cpu')
+        checkpoint = load_checkpoint(checkpoint_file)
+        metadata = checkpoint['metadata']
+        start_epoch = metadata.epoch + 1
+        best_epoch_idx = getattr(metadata, 'best_epoch_idx', metadata.epoch)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if scheduler is not None and checkpoint['scheduler'] is not None:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+
+        if metadata.torch_rng_state is not None:
+            restore_rng_states(metadata)
+
+        # Restore best metric and early stopping state
+        metric_name = getattr(metadata, 'best_metric_name', None) or args.optimize_objective
+        checkpoint_best_metric = getattr(metadata, 'best_metric', None)
+        checkpoint_best_objective = None
+        if checkpoint_best_metric is None:
+            checkpoint_best_objective = checkpoint.get('best_valid_objective_value')
+
+        if checkpoint_best_metric is not None:
+            best_valid_objective_value = -checkpoint_best_metric if metric_name == 'loss' else checkpoint_best_metric
+            write_log(
+                logger,
+                f"Restored best {metric_name} from checkpoint: {abs(best_valid_objective_value):.4f} at epoch {best_epoch_idx}"
+            )
+        elif checkpoint_best_objective is not None:
+            best_valid_objective_value = checkpoint_best_objective
+            write_log(
+                logger,
+                f"Restored best objective from checkpoint: {abs(best_valid_objective_value):.4f} at epoch {best_epoch_idx}"
+            )
         else:
-            checkpoint_file = None
+            write_log(logger, "Checkpoint missing best metric; continuing without restoration")
 
-        if checkpoint_file is None:
-            write_log(logger, f"No checkpoint found in {checkpoint_dir}, starting from scratch")
-        else:
-            model = model.to('cpu')
-            checkpoint = load_checkpoint(checkpoint_file)
-            metadata = checkpoint['metadata']
-            start_epoch = metadata.epoch + 1
-            best_epoch_idx = getattr(metadata, 'best_epoch_idx', metadata.epoch)
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            if scheduler is not None and checkpoint['scheduler'] is not None:
-                scheduler.load_state_dict(checkpoint['scheduler'])
+        restored_counter = getattr(metadata, 'early_stopping_counter', None)
+        if restored_counter is None:
+            restored_counter = checkpoint.get('early_stopping_counter', early_stopping_counter)
+        early_stopping_counter = restored_counter
+        write_log(logger, f"Restored early stopping counter: {early_stopping_counter}")
 
-            if metadata.torch_rng_state is not None:
-                restore_rng_states(metadata)
+        resume_wandb_id = metadata.wandb_id
+        model = model.to(device)
+        write_log(logger, f"Loaded checkpoint from {checkpoint_file}")
+        write_log(logger, f"Resuming from epoch {start_epoch}")
+        del checkpoint
 
-            # Restore best metric and early stopping state
-            metric_name = getattr(metadata, 'best_metric_name', None) or args.optimize_objective
-            checkpoint_best_metric = getattr(metadata, 'best_metric', None)
-            checkpoint_best_objective = None
-            if checkpoint_best_metric is None:
-                checkpoint_best_objective = checkpoint.get('best_valid_objective_value')
-
-            if checkpoint_best_metric is not None:
-                best_valid_objective_value = -checkpoint_best_metric if metric_name == 'loss' else checkpoint_best_metric
-                write_log(
-                    logger,
-                    f"Restored best {metric_name} from checkpoint: {abs(best_valid_objective_value):.4f} at epoch {best_epoch_idx}"
-                )
-            elif checkpoint_best_objective is not None:
-                best_valid_objective_value = checkpoint_best_objective
-                write_log(
-                    logger,
-                    f"Restored best objective from checkpoint: {abs(best_valid_objective_value):.4f} at epoch {best_epoch_idx}"
-                )
-            else:
-                write_log(logger, "Checkpoint missing best metric; continuing without restoration")
-
-            restored_counter = getattr(metadata, 'early_stopping_counter', None)
-            if restored_counter is None:
-                restored_counter = checkpoint.get('early_stopping_counter', early_stopping_counter)
-            early_stopping_counter = restored_counter
-            write_log(logger, f"Restored early stopping counter: {early_stopping_counter}")
-
-            resume_wandb_id = metadata.wandb_id
-            model = model.to(device)
-            write_log(logger, f"Loaded checkpoint from {checkpoint_file}")
-            write_log(logger, f"Resuming from epoch {start_epoch}")
-            del checkpoint
+    # Skip if already completed
+    if start_epoch >= args.num_epochs:
+        write_log(logger, f"Training already completed ({start_epoch} >= {args.num_epochs} epochs). Skipping.")
+        return
 
     # Initialize W&B
     if args.use_wandb:
