@@ -139,10 +139,20 @@ def training(args: argparse.Namespace) -> None:
 
     if args.job == 'resume_training':
         write_log(logger, "Resuming training model")
-        checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.pt')
+        # Prefer last.pt (latest state) over checkpoint.pt (best state)
+        last_checkpoint_file = os.path.join(checkpoint_dir, 'last.pt')
+        best_checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.pt')
+        if os.path.exists(last_checkpoint_file):
+            checkpoint_file = last_checkpoint_file
+            write_log(logger, "Found last.pt, resuming from latest state")
+        elif os.path.exists(best_checkpoint_file):
+            checkpoint_file = best_checkpoint_file
+            write_log(logger, "last.pt not found, falling back to checkpoint.pt (best state)")
+        else:
+            checkpoint_file = None
 
-        if not os.path.exists(checkpoint_file):
-            write_log(logger, f"Checkpoint not found at {checkpoint_file}, starting from scratch")
+        if checkpoint_file is None:
+            write_log(logger, f"No checkpoint found in {checkpoint_dir}, starting from scratch")
         else:
             model = model.to('cpu')
             checkpoint = load_checkpoint(checkpoint_file)
@@ -304,6 +314,25 @@ def training(args: argparse.Namespace) -> None:
         else:
             early_stopping_counter += 1
             write_log(logger, f"VALID - Early stopping counter: {early_stopping_counter}/{args.early_stopping_patience}")
+
+        # Save last checkpoint (every epoch for reliable resume)
+        check_path(checkpoint_dir)
+        last_metadata = create_metadata_from_args(
+            args,
+            epoch=epoch_idx,
+            wandb_id=wandb_mgr.run_id if wandb_mgr else None,
+            best_metric=abs(best_valid_objective_value) if best_valid_objective_value else None,
+            best_metric_name=args.optimize_objective,
+            best_epoch_idx=best_epoch_idx,
+            early_stopping_counter=early_stopping_counter
+        )
+        save_checkpoint(
+            os.path.join(checkpoint_dir, 'last.pt'),
+            model.state_dict(),
+            optimizer.state_dict(),
+            scheduler.state_dict() if scheduler is not None else None,
+            last_metadata
+        )
 
         # Log to W&B
         if args.use_wandb and wandb_mgr:
