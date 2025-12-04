@@ -161,17 +161,17 @@ docker compose exec pifi python -c "import torch; print('CUDA', torch.cuda.is_av
 # 1) Preprocess (sst2)
 docker compose exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job preprocessing --task_dataset sst2 \
-  --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64 --train_valid_split 0.95
+  --use_wandb false --num_workers 2 --max_seq_len 64 --train_valid_split 0.95
 
 # 2) Train base (1 epoch)
 docker compose exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job training --task_dataset sst2 --method base \
-  --num_epochs 1 --batch_size 16 --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64
+  --num_epochs 1 --batch_size 16 --use_wandb false --num_workers 2 --max_seq_len 64
 
 # 3) Test
 docker compose exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job testing --task_dataset sst2 --method base \
-  --batch_size 32 --use_wandb false --use_tensorboard false --num_workers 2 --max_seq_len 64
+  --batch_size 32 --use_wandb false --num_workers 2 --max_seq_len 64
 
 # 4) Stop services
 docker compose down
@@ -180,7 +180,7 @@ docker compose down
 Notes:
 - Some Docker/Compose versions may ignore GPU reservations; if so, use `docker compose run --gpus all ...` or the `up`+`exec` sequence above.
 - The entrypoint sets `HF_HOME=/app/cache/hf` (and `TRANSFORMERS_CACHE`/`HF_DATASETS_CACHE`) to avoid cache permission issues.
-- You can override first-run parameters via env vars on `up`: `DATASETS`, `MODEL`, `LLM`, `EPOCHS`, `BS`, `WORKERS`, `USE_WANDB`, `USE_TENSORBOARD`.
+- You can override first-run parameters via env vars on `up`: `DATASETS`, `MODEL`, `LLM`, `EPOCHS`, `BS`, `WORKERS`, `USE_WANDB`.
 
 ### Classification Tasks
 
