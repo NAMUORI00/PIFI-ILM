@@ -37,8 +37,6 @@ PiFi/
 │   ├── run_classification.sh # Classification-only wrapper
 │   ├── run_entailment.sh    # Entailment-only wrapper
 │   └── README.md            # Detailed script documentation
-├── Classification/          # Legacy structure (still functional)
-├── TextualEntailment/       # Legacy structure (still functional)
 └── requirements.txt         # Python dependencies
 ```
 

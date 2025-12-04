@@ -3,8 +3,7 @@
 ## Project Structure & Module Organization
 - `main.py` — unified entry point (recommended).
 - `core/` — shared arguments (`core/arguments.py`), utilities (`core/utils.py`), pipeline (`core/pipeline.py`).
-- `tasks/` — task proxies to legacy modules (classification → `Classification/`, entailment → `TextualEntailment/`).
-- `Classification/`, `TextualEntailment/` — legacy implementations (kept functional).
+ - `tasks/` — canonical task implementations (classification, entailment); legacy `Classification/` and `TextualEntailment/` have been removed.
 - `selection/ilm_direct.py` — ILM auto layer selection (PC patching) with reproducible flags.
 - `scripts/` — runners:
   - Unified: `scripts/run_experiments.sh` (root-path layout; recommended)

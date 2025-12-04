@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from model.entailment.model import EntailmentModel
-from model.entailment.dataset import CustomDataset
+from model.model import EntailmentModel
+from model.dataset import CustomDataset
 from core.optimizer import get_optimizer
 from core.scheduler import get_scheduler
 from utils.utils import TqdmLoggingHandler, write_log, get_wandb_exp_name, get_torch_device, check_path, worker_init_fn

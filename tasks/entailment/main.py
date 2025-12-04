@@ -17,11 +17,11 @@ def main(args) -> None:
     else:
         if args.task == 'entailment':
             if args.job == 'preprocessing':
-                from task.entailment.preprocessing import preprocessing as job
+                from task.preprocessing import preprocessing as job
             elif args.job in ['training', 'resume_training']:
-                from task.entailment.train import training as job
+                from task.train import training as job
             elif args.job == 'testing':
-                from task.entailment.test import testing as job
+                from task.test import testing as job
             else:
                 raise ValueError(f'Invalid job: {args.job}')
         else:

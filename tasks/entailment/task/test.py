@@ -12,8 +12,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from model.classification.model import ClassificationModel
-from model.classification.dataset import CustomDataset
+from model.model import EntailmentModel
+from model.dataset import CustomDataset
 from utils.utils import TqdmLoggingHandler, write_log, get_torch_device, worker_init_fn
 
 # Import from core modules
@@ -41,7 +41,7 @@ def testing(args: argparse.Namespace) -> tuple:
 
     # Load dataset
     write_log(logger, "Loading dataset")
-    dataset_test = CustomDataset(os.path.join(args.preprocess_path, args.task, args.test_dataset, args.model_type, 'test_processed.pkl'))
+    dataset_test = CustomDataset(os.path.join(args.preprocess_path, args.task, args.task_dataset, args.model_type, 'test_processed.pkl'))
     dataloader_test = DataLoader(
         dataset_test,
         batch_size=args.batch_size,
@@ -60,7 +60,7 @@ def testing(args: argparse.Namespace) -> tuple:
 
     # Build model
     write_log(logger, "Building model")
-    model = ClassificationModel(args).to(device)
+    model = EntailmentModel(args).to(device)
 
     # Load model weights
     write_log(logger, "Loading model weights")

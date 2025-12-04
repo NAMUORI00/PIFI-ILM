@@ -26,10 +26,10 @@ dev-tools:
 
 # Run tasks (pass args via ARGS="--job=... --task_dataset=..." )
 classify:
-	cd Classification && $(PY) main.py $(ARGS)
+	$(PY) main.py --task classification $(ARGS)
 
 entail:
-	cd TextualEntailment && $(PY) main.py $(ARGS)
+	$(PY) main.py --task entailment $(ARGS)
 
 # Lightweight environment + CUDA smoke test
 test:

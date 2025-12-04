@@ -22,32 +22,32 @@ def main(args: argparse.Namespace) -> None:
     else:
         if args.task == 'classification':
             if args.job == 'preprocessing':
-                from task.classification.preprocessing import preprocessing as job
+                from task.preprocessing import preprocessing as job
             elif args.job in ['training', 'resume_training']:
-                from task.classification.train import training as job
+                from task.train import training as job
             elif args.job == 'testing':
-                from task.classification.test import testing as job
+                from task.test import testing as job
             elif args.job == 'testing_example':
-                from task.classification.test_example import testing as job
-                 
+                from task.test_example import testing as job
+
             else:
                 raise ValueError(f'Invalid job: {args.job}')
         elif args.task == 'entailment':
             if args.job == 'preprocessing':
-                from task.entailment.preprocessing import preprocessing as job
+                from task.preprocessing import preprocessing as job
             elif args.job in ['training', 'resume_training']:
-                from task.entailment.train import training as job
+                from task.train import training as job
             elif args.job == 'testing':
-                from task.entailment.test import testing as job
+                from task.test import testing as job
             else:
                 raise ValueError(f'Invalid job: {args.job}')
         elif args.task == 'question_answering':
             if args.job == 'preprocessing':
-                from task.question_answering.preprocessing import preprocessing as job
+                from task.preprocessing import preprocessing as job
             elif args.job in ['training', 'resume_training']:
-                from task.question_answering.train import training as job
+                from task.train import training as job
             elif args.job == 'testing':
-                from task.question_answering.test import testing as job
+                from task.test import testing as job
             else:
                 raise ValueError(f'Invalid job: {args.job}')
         else:

@@ -22,37 +22,25 @@ def get_job_function(args: argparse.Namespace) -> Callable:
     task = args.task
     job = args.job
 
-    # Ensure legacy package roots are importable for internal absolute imports
-    # Legacy modules use 'from utils...' style expecting Classification/ or TextualEntailment/ on sys.path
-    try:
-        _root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        _cls = os.path.join(_root, 'Classification')
-        _ent = os.path.join(_root, 'TextualEntailment')
-        for _p in (_cls, _ent):
-            if os.path.isdir(_p) and _p not in sys.path:
-                sys.path.append(_p)
-    except Exception:
-        pass
-
     # Classification task
     if task == 'classification':
         if job == 'preprocessing':
-            from tasks.classification.task.classification.preprocessing import preprocessing as job_func
+            from tasks.classification.task.preprocessing import preprocessing as job_func
         elif job in ['training', 'resume_training']:
-            from tasks.classification.task.classification.train import training as job_func
+            from tasks.classification.task.train import training as job_func
         elif job == 'testing':
-            from tasks.classification.task.classification.test import testing as job_func
+            from tasks.classification.task.test import testing as job_func
         else:
             raise ValueError(f'Invalid job for classification: {job}')
 
     # Entailment task
     elif task == 'entailment':
         if job == 'preprocessing':
-            from tasks.entailment.task.entailment.preprocessing import preprocessing as job_func
+            from tasks.entailment.task.preprocessing import preprocessing as job_func
         elif job in ['training', 'resume_training']:
-            from tasks.entailment.task.entailment.train import training as job_func
+            from tasks.entailment.task.train import training as job_func
         elif job == 'testing':
-            from tasks.entailment.task.entailment.test import testing as job_func
+            from tasks.entailment.task.test import testing as job_func
         else:
             raise ValueError(f'Invalid job for entailment: {job}')
 
