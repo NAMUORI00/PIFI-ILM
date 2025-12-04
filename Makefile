@@ -42,7 +42,7 @@ clean:
 
 # Docker helpers
 docker-build:
-	docker build -t pifi:cu118 .
+	docker build -f docker/Dockerfile -t pifi:cu118 .
 
 docker-run:
 	# GPU 필요 시 --gpus all 추가
@@ -66,11 +66,11 @@ docker-test:
 
 # Compose helpers
 compose-build:
-	docker compose build
+	docker compose -f docker/docker-compose.yml build
 
 compose-run:
 	# 원샷 실행 (GPU는 --gpus all 로 전달)
-	docker compose run --rm --gpus all pifi python main.py --help
+	docker compose -f docker/docker-compose.yml run --rm --gpus all pifi python main.py --help
 
 compose-shell:
-	docker compose run --rm --gpus all pifi
+	docker compose -f docker/docker-compose.yml run --rm --gpus all pifi

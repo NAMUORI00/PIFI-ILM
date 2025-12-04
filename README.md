@@ -91,11 +91,11 @@ python main.py --task classification --job training --task_dataset sst2 \
 
 ## Docker (GPU)
 
-This repository includes a Dockerfile and optional docker-compose for convenience.
+Container assets live under `docker/` (`docker/Dockerfile`, `docker/docker-compose.yml`).
 
 Build the image:
 ```bash
-docker build -t pifi:cu118 .
+docker build -f docker/Dockerfile -t pifi:cu118 .
 ```
 
 Interactive shell with mounted artifacts:
@@ -128,10 +128,10 @@ docker run --rm --gpus all \
 
 Build and keep container running, then exec commands:
 ```bash
-docker compose build
-docker compose up -d pifi
+docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml up -d pifi
 # shell inside container
-docker compose exec pifi bash
+docker compose -f docker/docker-compose.yml exec pifi bash
 ```
 
 First-run auto experiment (classification + ILM):
@@ -140,43 +140,43 @@ First-run auto experiment (classification + ILM):
 # (defaults: DATASETS=sst2, MODEL=bert, LLM=llama3.1, EPOCHS=1, BS=8, USE_WANDB=false, USE_TENSORBOARD=false)
 # A marker is written to results/.first_run_done to avoid re-running next time.
 
-docker compose down
+docker compose -f docker/docker-compose.yml down
 rm -f results/.first_run_done  # optional: force re-run
-docker compose up -d pifi
+docker compose -f docker/docker-compose.yml up -d pifi
 
 # watch logs
-docker compose logs -f pifi
+docker compose -f docker/docker-compose.yml logs -f pifi
 
 # to skip auto-run
-FIRST_RUN=false docker compose up -d pifi
+FIRST_RUN=false docker compose -f docker/docker-compose.yml up -d pifi
 ```
 
 Compose quick test flow (GPU + HF cache path set):
 ```bash
 # 0) GPU check
-docker compose exec pifi python -c "import torch; print('CUDA', torch.cuda.is_available()); print('GPU', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+docker compose -f docker/docker-compose.yml exec pifi python -c "import torch; print('CUDA', torch.cuda.is_available()); print('GPU', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
 # 1) Preprocess (sst2)
-docker compose exec -e HF_HOME=/app/cache/hf \
+docker compose -f docker/docker-compose.yml exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job preprocessing --task_dataset sst2 \
   --use_wandb false --num_workers 2 --max_seq_len 64 --train_valid_split 0.95
 
 # 2) Train base (1 epoch)
-docker compose exec -e HF_HOME=/app/cache/hf \
+docker compose -f docker/docker-compose.yml exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job training --task_dataset sst2 --method base \
   --num_epochs 1 --batch_size 16 --use_wandb false --num_workers 2 --max_seq_len 64
 
 # 3) Test
-docker compose exec -e HF_HOME=/app/cache/hf \
+docker compose -f docker/docker-compose.yml exec -e HF_HOME=/app/cache/hf \
   pifi python main.py --task classification --job testing --task_dataset sst2 --method base \
   --batch_size 32 --use_wandb false --num_workers 2 --max_seq_len 64
 
 # 4) Stop services
-docker compose down
+docker compose -f docker/docker-compose.yml down
 ```
 
 Notes:
-- Some Docker/Compose versions may ignore GPU reservations; if so, use `docker compose run --gpus all ...` or the `up`+`exec` sequence above.
+- Some Docker/Compose versions may ignore GPU reservations; if so, use `docker compose -f docker/docker-compose.yml run --gpus all ...` or the `up`+`exec` sequence above.
 - The entrypoint sets `HF_HOME=/app/cache/hf` (and `TRANSFORMERS_CACHE`/`HF_DATASETS_CACHE`) to avoid cache permission issues.
 - You can override first-run parameters via env vars on `up`: `DATASETS`, `MODEL`, `LLM`, `EPOCHS`, `BS`, `WORKERS`, `USE_WANDB`.
 
