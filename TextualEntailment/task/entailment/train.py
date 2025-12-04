@@ -336,7 +336,7 @@ def training(args: argparse.Namespace) -> None:
             args,
             epoch=epoch_idx,
             wandb_id=wandb_mgr.run_id if wandb_mgr else None,
-            best_metric=abs(best_valid_objective_value) if best_valid_objective_value else None,
+            best_metric=abs(best_valid_objective_value) if best_valid_objective_value is not None else None,
             best_metric_name=args.optimize_objective,
             best_epoch_idx=best_epoch_idx,
             early_stopping_counter=early_stopping_counter
