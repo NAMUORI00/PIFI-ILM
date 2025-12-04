@@ -1,9 +1,14 @@
+"""
+Common Dataset class for PiFi tasks.
+Shared across classification and entailment tasks.
+"""
 import pickle
 from tqdm.auto import tqdm
 from torch.utils.data.dataset import Dataset
 
+
 class CustomDataset(Dataset):
-    def __init__(self, data_path:str) -> None:
+    def __init__(self, data_path: str) -> None:
         super(CustomDataset, self).__init__()
         with open(data_path, 'rb') as f:
             data_ = pickle.load(f)
@@ -24,7 +29,7 @@ class CustomDataset(Dataset):
 
         del data_
 
-    def __getitem__(self, idx:int) -> dict:
+    def __getitem__(self, idx: int) -> dict:
         return self.data_list[idx]
 
     def __len__(self) -> int:

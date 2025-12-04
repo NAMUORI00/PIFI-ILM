@@ -1,15 +1,14 @@
 import os
-import sys
 import pickle
 import argparse
-import bs4
 import pandas as pd
 from tqdm.auto import tqdm
 import torch
 from transformers import AutoTokenizer, AutoConfig
 from datasets import load_dataset
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from utils.utils import check_path, get_huggingface_model_name
+
+from core import check_path, get_huggingface_model_name
+from pifi.paths import get_preprocessed_dir
 
 def load_data(args: argparse.Namespace) -> tuple: 
     """
@@ -142,7 +141,7 @@ def preprocessing(args: argparse.Namespace) -> None:
         }
     }
 
-    preprocessed_path = os.path.join(args.preprocess_path, args.task, args.task_dataset, args.model_type)
+    preprocessed_path = get_preprocessed_dir(args)
     check_path(preprocessed_path)
 
     for split_data, split in zip([train_data, valid_data, test_data], ['train', 'valid', 'test']):

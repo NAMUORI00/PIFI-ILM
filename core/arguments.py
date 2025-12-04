@@ -58,33 +58,49 @@ class ArgParser():
                                  help='Method to use; Default is "pifi"')
 
         # Path arguments
-        # Defaults prefer container-friendly root-path layout when running in Docker
-        # and fall back to legacy user home layout on bare metal. All can be overridden
-        # by environment variables: PIFI_*_PATH.
+        # Unified path structure (v3):
+        #   --data_path    : Raw datasets (external, read-only)
+        #   --cache_path   : HuggingFace model cache (.cache/)
+        #   --logs_path    : All experiment artifacts (logs/)
+        #                    ├── preprocessed/   (preprocessed data)
+        #                    └── experiments/    (checkpoints, models, results)
+        #
+        # Legacy paths (deprecated): --preprocess_path, --model_path, --checkpoint_path, --result_path
         is_docker = os.path.exists('/.dockerenv') or os.environ.get('PIFI_IN_DOCKER') == '1'
         default_root = '/app' if is_docker else f'/nas_homes/{self.user_name}'
 
         def _env_or(key: str, default: str) -> str:
             return os.environ.get(key, default)
 
+        # Primary paths (v3)
         data_path_def = _env_or('PIFI_DATA_PATH', f'{default_root}/dataset' + ('/' if not default_root.endswith('/') else ''))
-        cache_path_def = _env_or('PIFI_CACHE_PATH', f'{default_root}/cache' if is_docker else f'/nas_homes/{self.user_name}/model')
-        preprocess_path_def = _env_or('PIFI_PREPROCESS_PATH', f'{default_root}/preprocessed' if is_docker else f'/nas_homes/{self.user_name}/preprocessed/PiFi')
-        model_path_def = _env_or('PIFI_MODEL_PATH', f'{default_root}/models' if is_docker else f'/nas_homes/{self.user_name}/model_final/PiFi')
-        checkpoint_path_def = _env_or('PIFI_CHECKPOINT_PATH', f'{default_root}/checkpoints' if is_docker else f'/nas_homes/{self.user_name}/model_checkpoint/PiFi')
-        result_path_def = _env_or('PIFI_RESULT_PATH', f'{default_root}/results' if is_docker else f'/nas_homes/{self.user_name}/results/PiFi')
+        cache_path_def = _env_or('PIFI_CACHE_PATH', f'{default_root}/.cache' if is_docker else f'/nas_homes/{self.user_name}/.cache')
+        # logs_path: Empty default to allow result_path backward compat; actual default set in get_args()
+        logs_path_def = _env_or('PIFI_LOGS_PATH', '')
+
+        # Legacy paths (deprecated, for backward compatibility)
+        preprocess_path_def = _env_or('PIFI_PREPROCESS_PATH', '')  # Empty = use logs_path/preprocessed
+        model_path_def = _env_or('PIFI_MODEL_PATH', '')  # Empty = use logs_path/experiments
+        checkpoint_path_def = _env_or('PIFI_CHECKPOINT_PATH', '')  # Empty = use logs_path/experiments
+        result_path_def = _env_or('PIFI_RESULT_PATH', '')  # Empty = alias for logs_path
+
+        # Primary path arguments
         self.parser.add_argument('--data_path', type=str, default=data_path_def,
                                  help='Path to the raw dataset before preprocessing')
         self.parser.add_argument('--cache_path', type=str, default=cache_path_def,
-                                 help='Path to the cache file.')
+                                 help='Path to HuggingFace model cache (.cache/)')
+        self.parser.add_argument('--logs_path', type=str, default=logs_path_def,
+                                 help='Path to all experiment artifacts (preprocessed/, experiments/)')
+
+        # Legacy path arguments (deprecated)
         self.parser.add_argument('--preprocess_path', type=str, default=preprocess_path_def,
-                                 help='Path to the preprocessed dataset.')
+                                 help='[DEPRECATED] Use --logs_path instead. Preprocessed data saved to logs/preprocessed/')
         self.parser.add_argument('--model_path', type=str, default=model_path_def,
-                                 help='Path to the model after training.')
+                                 help='[DEPRECATED] Use --logs_path instead. Models saved to logs/experiments/')
         self.parser.add_argument('--checkpoint_path', type=str, default=checkpoint_path_def,
-                                 help='Path to model checkpoints during training.')
+                                 help='[DEPRECATED] Use --logs_path instead. Checkpoints saved to logs/experiments/')
         self.parser.add_argument('--result_path', type=str, default=result_path_def,
-                                 help='Path to the result after testing.')
+                                 help='[DEPRECATED] Alias for --logs_path')
 
         # Model - Basic arguments
         self.parser.add_argument('--proj_name', type=str, default='PiFi',
@@ -227,7 +243,9 @@ class ArgParser():
         self.parser.add_argument('--selection_plot_max_layers', type=int, default=6,
                                  help='Max number of layers to plot PCA scatter; Default is 6')
         self.parser.add_argument('--save_selection_plots', type=parse_bool, default=False,
-                                 help='Save ILM selection plots to disk (result_path/selection_plots/); Default is False')
+                                 help='Save ILM selection plots to disk (result_path/logs/); Default is False')
+        self.parser.add_argument('--log_test_local', type=parse_bool, default=True,
+                                 help='Save test results to local JSON (result_path/logs/); Default is True')
         self.parser.add_argument('--log_freq', default=500, type=int,
                                  help='Logging frequency; Default is 500')
 
@@ -245,5 +263,18 @@ class ArgParser():
         # Update test_dataset if not specified
         if not hasattr(args, 'test_dataset') or args.test_dataset == 'sst2':
             args.test_dataset = args.task_dataset
+
+        # Backward compatibility: result_path → logs_path alias
+        if args.result_path and not args.logs_path:
+            args.logs_path = args.result_path
+        elif not args.logs_path:
+            # Set default if neither is set
+            is_docker = os.path.exists('/.dockerenv') or os.environ.get('PIFI_IN_DOCKER') == '1'
+            default_root = '/app' if is_docker else f'/nas_homes/{self.user_name}'
+            args.logs_path = f'{default_root}/logs' if is_docker else f'/nas_homes/{self.user_name}/logs/PiFi'
+
+        # Backward compatibility: Set result_path as alias to logs_path
+        if not args.result_path:
+            args.result_path = args.logs_path
 
         return args

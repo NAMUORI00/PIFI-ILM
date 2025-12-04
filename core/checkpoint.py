@@ -177,48 +177,5 @@ def restore_rng_states(metadata: CheckpointMetadata) -> None:
         torch.cuda.set_rng_state_all(metadata.cuda_rng_state)
 
 
-def get_experiment_path(base_path: str, args: argparse.Namespace) -> str:
-    """
-    Generate a unified experiment path.
-
-    Structure: {base_path}/{task}/{dataset}/{padding}/{model_type}/{method}/{llm_model}/{layer_num}/
-
-    This unifies:
-    - Checkpoint save paths
-    - Model save paths
-    - Resume load paths
-
-    Args:
-        base_path: Base directory (e.g., args.checkpoint_path)
-        args: Parsed arguments with experiment configuration
-
-    Returns:
-        Full experiment directory path
-    """
-    path_parts = [
-        base_path,
-        args.task,
-        args.task_dataset,
-        args.padding,
-        args.model_type,
-        args.method,
-    ]
-
-    # Add LLM-specific paths for pifi method
-    if args.method == 'pifi':
-        path_parts.extend([args.llm_model, str(args.layer_num)])
-    else:
-        # For non-pifi, use 'none' placeholders for consistent structure
-        path_parts.extend(['none', 'none'])
-
-    return os.path.join(*path_parts)
-
-
-def get_checkpoint_path(args: argparse.Namespace) -> str:
-    """Get checkpoint directory path"""
-    return get_experiment_path(args.checkpoint_path, args)
-
-
-def get_model_path(args: argparse.Namespace) -> str:
-    """Get final model directory path"""
-    return get_experiment_path(args.model_path, args)
+# Path functions moved to pifi/paths.py
+# Import from pifi.paths or core (which re-exports from pifi.paths) instead

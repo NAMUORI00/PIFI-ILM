@@ -36,6 +36,7 @@ WORKERS=${WORKERS:-0}
 SEED=${SEED:-2023}
 LLM=${LLM:-qwen2_0.5b}
 MAX_LAYER=${MAX_LAYER:-23}
+USE_WANDB=${USE_WANDB:-false}
 
 # === Paths ===
 CACHE_PATH=${CACHE_PATH:-"$ROOT_DIR/cache"}
@@ -48,6 +49,7 @@ echo "[INFO] Task: $TASK"
 echo "[INFO] Dataset(s): $DATASET"
 echo "[INFO] Epochs: $EPOCHS, Batch Size: $BATCH_SIZE"
 echo "[INFO] LLM: $LLM, Max Layer: $MAX_LAYER"
+echo "[INFO] W&B Logging: $USE_WANDB"
 
 for DS in $DATASET; do
   echo ""
@@ -62,7 +64,7 @@ for DS in $DATASET; do
     --num_epochs "$EPOCHS"
     --batch_size "$BATCH_SIZE"
     --num_workers "$WORKERS"
-    --use_wandb false
+    --use_wandb "$USE_WANDB"
     --cache_path "$CACHE_PATH"
     --preprocess_path "$PREPROCESS_PATH"
     --model_path "$MODEL_PATH"

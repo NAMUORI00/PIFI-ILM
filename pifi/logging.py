@@ -1,272 +1,72 @@
 """
-Centralized W&B (Weights & Biases) management for PiFi
-Provides a unified interface for experiment tracking, logging, and resume support.
+PiFi-Specific Logging Utilities
+
+This module provides:
+- PiFiLogger: Unified logging for both W&B and local files
+- create_wandb_config: Factory function for W&B configuration
+- get_wandb_exp_name: Experiment name generation
 """
 
 import os
 import json
-import subprocess
 import argparse
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Union
-from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List
 
 import matplotlib.pyplot as plt
 import pandas as pd
 
 
-@dataclass
-class WandbConfig:
-    """Configuration container for W&B initialization"""
-    project: str
-    name: str
-    entity: Optional[str] = None
-    config: Dict[str, Any] = field(default_factory=dict)
-    notes: str = ""
-    tags: List[str] = field(default_factory=list)
-    resume: bool = False
-    run_id: Optional[str] = None
-
-
-class WandbManager:
+def get_wandb_exp_name(args: argparse.Namespace) -> str:
     """
-    Singleton manager for W&B experiment tracking.
-    Handles initialization, logging, resume, and cleanup.
+    Get the experiment name for Weights & Biases experiment.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        Formatted experiment name string
     """
+    exp_name = str(args.seed)
+    exp_name += " %s - " % args.task.upper()
+    exp_name += "%s / " % args.task_dataset.upper()
+    if args.task_dataset != args.test_dataset:
+        exp_name += "%s / " % args.test_dataset
+    exp_name += "%s" % args.model_type.upper()
+    exp_name += " - %s" % args.method.upper()
+    if 'ablation' in args.proj_name:
+        exp_name += ' - %s' % args.padding.upper()
+    if args.method == 'pifi':
+        if args.freeze == False:
+            exp_name += " - freeze(x)"
+        exp_name += " - %s" % args.llm_model.upper()
+        exp_name += "(%s)" % args.layer_num
 
-    _instance: Optional['WandbManager'] = None
-
-    def __init__(self):
-        self._initialized = False
-        self._run = None
-        self._run_id: Optional[str] = None
-
-    @classmethod
-    def get_instance(cls) -> 'WandbManager':
-        """Get or create singleton instance"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    @classmethod
-    def reset_instance(cls) -> None:
-        """Reset singleton instance (for testing or re-initialization)"""
-        if cls._instance is not None:
-            cls._instance.finish()
-        cls._instance = None
-
-    def init(self, config: WandbConfig, model=None, criterion=None) -> str:
-        """
-        Initialize W&B run.
-
-        Args:
-            config: WandbConfig instance with run settings
-            model: Optional model to watch for gradient logging
-            criterion: Optional loss function for model watching
-
-        Returns:
-            run_id: The W&B run ID for checkpoint storage
-        """
-        import wandb
-
-        init_kwargs = {
-            'project': config.project,
-            'name': config.name,
-            'config': config.config,
-            'notes': config.notes,
-            'tags': config.tags,
-            'settings': wandb.Settings(save_code=True),
-        }
-
-        if config.entity:
-            init_kwargs['entity'] = config.entity
-
-        if config.resume and config.run_id:
-            init_kwargs['resume'] = True
-            init_kwargs['id'] = config.run_id
-
-        self._run = wandb.init(**init_kwargs)
-        self._run_id = self._run.id
-        self._initialized = True
-
-        # Log git commit info
-        self._log_git_info()
-
-        # Watch model if provided
-        if model is not None:
-            wandb.watch(models=model, criterion=criterion, log='all', log_freq=10)
-
-        return self._run_id
-
-    @property
-    def run_id(self) -> Optional[str]:
-        """Get current run ID"""
-        return self._run_id
-
-    @property
-    def is_initialized(self) -> bool:
-        """Check if W&B is initialized"""
-        return self._initialized
-
-    def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-        """
-        Log metrics to W&B.
-
-        Args:
-            metrics: Dictionary of metric names to values
-            step: Optional step number for x-axis
-        """
-        if not self._initialized:
-            return
-        import wandb
-        wandb.log(metrics, step=step)
-
-    def log_table(self, key: str, dataframe) -> None:
-        """
-        Log a pandas DataFrame as a W&B table.
-
-        Args:
-            key: Table name in W&B
-            dataframe: pandas DataFrame to log
-        """
-        if not self._initialized:
-            return
-        import wandb
-        table = wandb.Table(dataframe=dataframe)
-        wandb.log({key: table})
-
-    def log_image(self, key: str, images: List, captions: Optional[List[str]] = None) -> None:
-        """
-        Log images to W&B.
-
-        Args:
-            key: Image group name
-            images: List of images (PIL, numpy, or file paths)
-            captions: Optional list of captions for each image
-        """
-        if not self._initialized:
-            return
-        import wandb
-        if captions:
-            wandb_imgs = [wandb.Image(img, caption=cap) for img, cap in zip(images, captions)]
-        else:
-            wandb_imgs = [wandb.Image(img) for img in images]
-        wandb.log({key: wandb_imgs})
-
-    def log_artifact(self, name: str, artifact_type: str, file_path: str,
-                     metadata: Optional[Dict] = None) -> None:
-        """
-        Log a file as a W&B artifact.
-
-        Args:
-            name: Artifact name
-            artifact_type: Type of artifact (e.g., 'model', 'dataset')
-            file_path: Path to file to upload
-            metadata: Optional metadata dictionary
-        """
-        if not self._initialized:
-            return
-        import wandb
-        artifact = wandb.Artifact(name, type=artifact_type, metadata=metadata or {})
-        artifact.add_file(file_path)
-        wandb.log_artifact(artifact)
-
-    def alert(self, title: str, text: str, level: str = 'INFO',
-              wait_duration: int = 300) -> None:
-        """
-        Send an alert notification.
-
-        Args:
-            title: Alert title
-            text: Alert message body
-            level: Alert level ('INFO', 'WARN', 'ERROR')
-            wait_duration: Minimum seconds between alerts of same title
-        """
-        if not self._initialized:
-            return
-        import wandb
-        from wandb import AlertLevel
-        level_map = {
-            'INFO': AlertLevel.INFO,
-            'WARN': AlertLevel.WARN,
-            'ERROR': AlertLevel.ERROR
-        }
-        wandb.alert(
-            title=title,
-            text=text,
-            level=level_map.get(level, AlertLevel.INFO),
-            wait_duration=wait_duration
-        )
-
-    def finish(self) -> None:
-        """Finish the W&B run and cleanup"""
-        if self._initialized:
-            import wandb
-            wandb.finish()
-            self._initialized = False
-            self._run = None
-
-    def _log_git_info(self) -> None:
-        """Log git commit information to W&B"""
-        if not self._initialized:
-            return
-        import wandb
-        try:
-            commit = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                stderr=subprocess.DEVNULL
-            ).decode().strip()
-            wandb.config.update({'git_commit': commit}, allow_val_change=True)
-            short = commit[:7]
-            current_tags = list(wandb.run.tags or [])
-            wandb.run.tags = list(set(current_tags + [f"GIT:{short}"]))
-            wandb.log_code(root=os.getcwd())
-        except Exception:
-            pass  # Git not available or not a git repo
-
-    def log_figure(self, key: str, figure: plt.Figure, caption: Optional[str] = None) -> None:
-        """
-        Log a matplotlib figure to W&B.
-
-        Args:
-            key: Name for the figure in W&B
-            figure: matplotlib Figure object
-            caption: Optional caption for the figure
-        """
-        if not self._initialized:
-            return
-        import wandb
-        wandb.log({key: wandb.Image(figure, caption=caption)})
-
-    def log_summary(self, summary: Dict[str, Any]) -> None:
-        """
-        Log summary metrics that appear in W&B run overview.
-
-        Args:
-            summary: Dictionary of summary metrics
-        """
-        if not self._initialized:
-            return
-        import wandb
-        for key, value in summary.items():
-            wandb.run.summary[key] = value
+    return exp_name
 
 
 class LocalFallbackLogger:
     """
     Fallback logger that saves to local files when W&B is disabled.
-    Saves to unified path: {result_path}/logs/{task}/{dataset}/{model}/{method}/{llm}/{layer}/
+    Saves to unified experiment directory.
     """
 
-    def __init__(self, result_path: str, task: str, dataset: str,
-                 model_type: str, method: str, llm_model: str = '', layer_num: int = -1):
-        self.result_path = result_path
-        self.base_path = os.path.join(
-            result_path, 'logs', task, dataset, model_type, method
-        )
-        if method == 'pifi' and llm_model:
-            self.base_path = os.path.join(self.base_path, llm_model, str(layer_num))
+    def __init__(self, experiment_dir: str):
+        """
+        Initialize with experiment directory.
+
+        Args:
+            experiment_dir: Full path to experiment directory
+                (from get_experiment_dir() or manually constructed)
+        """
+        self.base_path = experiment_dir
         os.makedirs(self.base_path, exist_ok=True)
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> 'LocalFallbackLogger':
+        """Create logger from parsed arguments using unified path structure."""
+        from .paths import get_experiment_dir
+        return cls(get_experiment_dir(args))
 
     def log_json(self, data: Dict[str, Any], filename: str) -> str:
         """Save data as JSON file, return path."""
@@ -295,10 +95,20 @@ class PiFiLogger:
     When W&B is disabled: logs to local files only.
     """
 
-    def __init__(self, use_wandb: bool, result_path: str, task: str, dataset: str,
-                 model_type: str, method: str, llm_model: str = '', layer_num: int = -1):
+    def __init__(self, use_wandb: bool, experiment_dir: str,
+                 result_path: str = '', task: str = '', dataset: str = '',
+                 model_type: str = '', method: str = '', llm_model: str = '', layer_num: int = -1):
+        """
+        Initialize PiFiLogger.
+
+        Args:
+            use_wandb: Whether to use W&B logging
+            experiment_dir: Full path to experiment directory (from get_experiment_dir())
+            result_path: Result path (for legacy selection path)
+            task, dataset, model_type, method, llm_model, layer_num: Experiment metadata
+        """
         self._use_wandb = use_wandb
-        self._wandb_mgr = WandbManager.get_instance() if use_wandb else None
+        self._experiment_dir = experiment_dir
         self._result_path = result_path
         self._task = task
         self._dataset = dataset
@@ -306,15 +116,20 @@ class PiFiLogger:
         self._method = method
         self._llm_model = llm_model
         self._layer_num = layer_num
-        self._local_logger = LocalFallbackLogger(
-            result_path, task, dataset, model_type, method, llm_model, layer_num
-        )
+        self._local_logger = LocalFallbackLogger(experiment_dir)
+        # Lazy import WandbManager to avoid circular imports
+        self._wandb_mgr = None
+        if use_wandb:
+            from core.wandb_manager import WandbManager
+            self._wandb_mgr = WandbManager.get_instance()
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> 'PiFiLogger':
-        """Create logger from parsed arguments."""
+        """Create logger from parsed arguments using unified path structure."""
+        from .paths import get_experiment_dir
         return cls(
             use_wandb=getattr(args, 'use_wandb', False),
+            experiment_dir=get_experiment_dir(args),
             result_path=getattr(args, 'result_path', 'results'),
             task=getattr(args, 'task', 'classification'),
             dataset=getattr(args, 'task_dataset', 'sst2'),
@@ -356,7 +171,6 @@ class PiFiLogger:
         json_path = self._local_logger.log_json(selection_data, 'selection.json')
 
         # Mirror to historical layer_selection path for downstream consumers
-        legacy_json_path = None
         if self._method == 'pifi' and self._llm_model:
             legacy_json_path = os.path.join(
                 self._result_path,
@@ -488,7 +302,7 @@ class PiFiLogger:
             })
 
 
-def create_wandb_config(args: argparse.Namespace, job_type: str = 'train') -> WandbConfig:
+def create_wandb_config(args: argparse.Namespace, job_type: str = 'train'):
     """
     Factory function to create WandbConfig from args.
     Consolidates experiment naming logic in one place.
@@ -500,6 +314,8 @@ def create_wandb_config(args: argparse.Namespace, job_type: str = 'train') -> Wa
     Returns:
         WandbConfig instance ready for initialization
     """
+    from core.wandb_manager import WandbConfig
+
     project = os.environ.get('WANDB_PROJECT') or args.proj_name
     entity = os.environ.get('WANDB_ENTITY')
 

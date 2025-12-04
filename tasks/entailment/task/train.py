@@ -1,38 +1,29 @@
+"""
+Entailment Task - Training Module
+
+Uses BaseTrainer for common training/validation logic.
+"""
+
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import sys
 import shutil
 import logging
 import argparse
-from tqdm.auto import tqdm
-from sklearn.metrics import f1_score
 import torch
 torch.set_num_threads(2)
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_
 
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from model.model import EntailmentModel
-from model.dataset import CustomDataset
-from core.optimizer import get_optimizer
-from core.scheduler import get_scheduler
-from utils.utils import TqdmLoggingHandler, write_log, get_wandb_exp_name, get_torch_device, check_path, worker_init_fn
-
-# Import from core modules
-try:
-    from core.wandb_manager import WandbManager, create_wandb_config
-    from core.checkpoint import (
-        save_checkpoint, load_checkpoint, restore_rng_states,
-        create_metadata_from_args, get_checkpoint_path, get_model_path
-    )
-except ImportError:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-    from core.wandb_manager import WandbManager, create_wandb_config
-    from core.checkpoint import (
-        save_checkpoint, load_checkpoint, restore_rng_states,
-        create_metadata_from_args, get_checkpoint_path, get_model_path
-    )
+from tasks.entailment.model.model import EntailmentModel
+from tasks.shared import CustomDataset, BaseTrainer
+from core import (
+    get_optimizer, get_scheduler,
+    TqdmLoggingHandler, write_log, get_torch_device, check_path, worker_init_fn,
+    WandbManager, create_wandb_config, PiFiLogger,
+    save_checkpoint, load_checkpoint, restore_rng_states,
+)
+from core.checkpoint import create_metadata_from_args
+from pifi.paths import get_checkpoint_dir, get_model_path, get_preprocessed_dir
 
 try:
     from selection import auto_select_layer
@@ -57,8 +48,9 @@ def training(args: argparse.Namespace) -> None:
     # Load data
     write_log(logger, "Loading data")
     dataset_dict, dataloader_dict = {}, {}
-    dataset_dict['train'] = CustomDataset(os.path.join(args.preprocess_path, args.task, args.task_dataset, args.model_type, 'train_processed.pkl'))
-    dataset_dict['valid'] = CustomDataset(os.path.join(args.preprocess_path, args.task, args.task_dataset, args.model_type, 'valid_processed.pkl'))
+    preprocessed_dir = get_preprocessed_dir(args)
+    dataset_dict['train'] = CustomDataset(os.path.join(preprocessed_dir, 'train_processed.pkl'))
+    dataset_dict['valid'] = CustomDataset(os.path.join(preprocessed_dir, 'valid_processed.pkl'))
 
     # Create reproducible DataLoaders
     train_generator = torch.Generator().manual_seed(args.seed)
@@ -130,7 +122,7 @@ def training(args: argparse.Namespace) -> None:
 
     # Resume training if needed
     start_epoch = 0
-    checkpoint_dir = get_checkpoint_path(args)
+    checkpoint_dir = get_checkpoint_dir(args)
     resume_wandb_id = None
     best_epoch_idx = 0
     best_valid_objective_value = None
@@ -138,7 +130,6 @@ def training(args: argparse.Namespace) -> None:
 
     if args.job == 'resume_training':
         write_log(logger, "Resuming training model")
-        # Prefer last.pt (latest state) over checkpoint.pt (best state)
         last_checkpoint_file = os.path.join(checkpoint_dir, 'last.pt')
         best_checkpoint_file = os.path.join(checkpoint_dir, 'checkpoint.pt')
         if os.path.exists(last_checkpoint_file):
@@ -163,7 +154,6 @@ def training(args: argparse.Namespace) -> None:
             if scheduler is not None and checkpoint['scheduler'] is not None:
                 scheduler.load_state_dict(checkpoint['scheduler'])
 
-            # Restore RNG states for reproducibility
             if metadata.torch_rng_state is not None:
                 restore_rng_states(metadata)
 
@@ -172,7 +162,6 @@ def training(args: argparse.Namespace) -> None:
             checkpoint_best_metric = getattr(metadata, 'best_metric', None)
             checkpoint_best_objective = None
             if checkpoint_best_metric is None:
-                # Fallback for older checkpoints that may store the signed objective directly
                 checkpoint_best_objective = checkpoint.get('best_valid_objective_value')
 
             if checkpoint_best_metric is not None:
@@ -210,91 +199,28 @@ def training(args: argparse.Namespace) -> None:
             wandb_config.run_id = resume_wandb_id
         wandb_mgr.init(wandb_config, model=model, criterion=cls_loss)
 
+    # Create trainer for training/validation loops
+    trainer = BaseTrainer(args, model, device, logger)
+
     # Training loop
     write_log(logger, f"Start training from epoch {start_epoch}")
     for epoch_idx in range(start_epoch, args.num_epochs):
-        model = model.train()
-        train_loss_cls = 0
-        train_acc_cls = 0
-        train_f1_cls = 0
-
-        for iter_idx, data_dicts in enumerate(tqdm(dataloader_dict['train'], total=len(dataloader_dict['train']), desc=f'Training - Epoch [{epoch_idx}/{args.num_epochs}]', position=0, leave=True)):
-            input_ids = data_dicts['input_ids'].to(device)
-            attention_mask = data_dicts['attention_mask'].to(device)
-            token_type_ids = data_dicts['token_type_ids'].to(device)
-            labels = data_dicts['labels'].to(device)
-
-            classification_logits = model(input_ids, attention_mask, token_type_ids)
-
-            batch_loss_cls = cls_loss(classification_logits, labels)
-            batch_acc_cls = (classification_logits.argmax(dim=-1) == labels).float().mean()
-            batch_f1_cls = f1_score(labels.cpu().numpy(), classification_logits.argmax(dim=-1).cpu().numpy(), average='macro')
-
-            optimizer.zero_grad()
-            batch_loss_cls.backward()
-            if args.clip_grad_norm > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-            optimizer.step()
-            if args.scheduler in ['StepLR', 'CosineAnnealingLR', 'CosineAnnealingWarmRestarts']:
-                scheduler.step()
-
-            train_loss_cls += batch_loss_cls.item()
-            train_acc_cls += batch_acc_cls.item()
-            train_f1_cls += batch_f1_cls
-
-            if iter_idx % args.log_freq == 0 or iter_idx == len(dataloader_dict['train']) - 1:
-                write_log(logger, f"TRAIN - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['train'])}] - Loss: {batch_loss_cls.item():.4f}")
-                write_log(logger, f"TRAIN - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['train'])}] - Acc: {batch_acc_cls.item():.4f}")
-                write_log(logger, f"TRAIN - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['train'])}] - F1: {batch_f1_cls:.4f}")
+        # Training
+        train_metrics = trainer.train_epoch(
+            dataloader_dict['train'], optimizer, scheduler, cls_loss, epoch_idx
+        )
 
         # Validation
-        model = model.eval()
-        valid_loss_cls = 0
-        valid_acc_cls = 0
-        valid_f1_cls = 0
+        valid_metrics = trainer.validate(dataloader_dict['valid'], cls_loss, epoch_idx)
 
-        for iter_idx, data_dicts in enumerate(tqdm(dataloader_dict['valid'], total=len(dataloader_dict['valid']), desc=f'Validating - Epoch [{epoch_idx}/{args.num_epochs}]', position=0, leave=True)):
-            input_ids = data_dicts['input_ids'].to(device)
-            attention_mask = data_dicts['attention_mask'].to(device)
-            token_type_ids = data_dicts['token_type_ids'].to(device)
-            labels = data_dicts['labels'].to(device)
-
-            with torch.no_grad():
-                classification_logits = model(input_ids, attention_mask, token_type_ids)
-
-            batch_loss_cls = cls_loss(classification_logits, labels)
-            batch_acc_cls = (classification_logits.argmax(dim=-1) == labels).float().mean()
-            batch_f1_cls = f1_score(labels.cpu().numpy(), classification_logits.argmax(dim=-1).cpu().numpy(), average='macro')
-
-            valid_loss_cls += batch_loss_cls.item()
-            valid_acc_cls += batch_acc_cls.item()
-            valid_f1_cls += batch_f1_cls
-
-            if iter_idx % args.log_freq == 0 or iter_idx == len(dataloader_dict['valid']) - 1:
-                write_log(logger, f"VALID - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['valid'])}] - Loss: {batch_loss_cls.item():.4f}")
-                write_log(logger, f"VALID - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['valid'])}] - Acc: {batch_acc_cls.item():.4f}")
-                write_log(logger, f"VALID - Epoch [{epoch_idx}/{args.num_epochs}] - Iter [{iter_idx}/{len(dataloader_dict['valid'])}] - F1: {batch_f1_cls:.4f}")
-
-        # Scheduler step
+        # Scheduler step (epoch-level)
         if args.scheduler == 'LambdaLR':
             scheduler.step()
         elif args.scheduler == 'ReduceLROnPlateau':
-            scheduler.step(valid_loss_cls)
-
-        # Compute epoch metrics
-        valid_loss_cls /= len(dataloader_dict['valid'])
-        valid_acc_cls /= len(dataloader_dict['valid'])
-        valid_f1_cls /= len(dataloader_dict['valid'])
+            scheduler.step(valid_metrics['loss'])
 
         # Determine objective value
-        if args.optimize_objective == 'loss':
-            valid_objective_value = -1 * valid_loss_cls
-        elif args.optimize_objective == 'accuracy':
-            valid_objective_value = valid_acc_cls
-        elif args.optimize_objective == 'f1':
-            valid_objective_value = valid_f1_cls
-        else:
-            raise NotImplementedError
+        valid_objective_value = trainer.get_objective_value(valid_metrics)
 
         # Save best checkpoint
         if best_valid_objective_value is None or valid_objective_value > best_valid_objective_value:
@@ -305,7 +231,6 @@ def training(args: argparse.Namespace) -> None:
 
             check_path(checkpoint_dir)
 
-            # Create metadata with wandb_id for resume support
             metadata = create_metadata_from_args(
                 args,
                 epoch=epoch_idx,
@@ -330,7 +255,7 @@ def training(args: argparse.Namespace) -> None:
             early_stopping_counter += 1
             write_log(logger, f"VALID - Early stopping counter: {early_stopping_counter}/{args.early_stopping_patience}")
 
-        # Save last checkpoint (every epoch for reliable resume)
+        # Save last checkpoint
         check_path(checkpoint_dir)
         last_metadata = create_metadata_from_args(
             args,
@@ -352,18 +277,18 @@ def training(args: argparse.Namespace) -> None:
         # Log to W&B
         if args.use_wandb and wandb_mgr:
             wandb_mgr.log({
-                'TRAIN/Epoch_Loss': train_loss_cls / len(dataloader_dict['train']),
-                'TRAIN/Epoch_Acc': train_acc_cls / len(dataloader_dict['train']),
-                'TRAIN/Epoch_F1': train_f1_cls / len(dataloader_dict['train']),
-                'VALID/Epoch_Loss': valid_loss_cls,
-                'VALID/Epoch_Acc': valid_acc_cls,
-                'VALID/Epoch_F1': valid_f1_cls,
+                'TRAIN/Epoch_Loss': train_metrics['loss'],
+                'TRAIN/Epoch_Acc': train_metrics['accuracy'],
+                'TRAIN/Epoch_F1': train_metrics['f1'],
+                'VALID/Epoch_Loss': valid_metrics['loss'],
+                'VALID/Epoch_Acc': valid_metrics['accuracy'],
+                'VALID/Epoch_F1': valid_metrics['f1'],
                 'Learning_Rate': optimizer.param_groups[0]['lr'],
                 'Epoch_Index': epoch_idx
             })
             wandb_mgr.alert(
                 title='Epoch End',
-                text=f"VALID - Epoch {epoch_idx} - Loss: {valid_loss_cls:.4f} - Acc: {valid_acc_cls:.4f}",
+                text=f"VALID - Epoch {epoch_idx} - Loss: {valid_metrics['loss']:.4f} - Acc: {valid_metrics['accuracy']:.4f}",
                 level='INFO',
                 wait_duration=300
             )
@@ -375,11 +300,23 @@ def training(args: argparse.Namespace) -> None:
 
     write_log(logger, f"Done! Best valid at epoch {best_epoch_idx} - {args.optimize_objective}: {abs(best_valid_objective_value):.4f}")
 
-    # Save final model
-    final_model_dir = get_model_path(args)
-    check_path(final_model_dir)
-    shutil.copyfile(os.path.join(checkpoint_dir, 'checkpoint.pt'), os.path.join(final_model_dir, 'final_model.pt'))
-    write_log(logger, f"FINAL - Saved final model to {final_model_dir}")
+    # Save final model (copy best checkpoint to final_model.pt)
+    final_model_path = get_model_path(args)
+    check_path(os.path.dirname(final_model_path))
+    shutil.copyfile(os.path.join(checkpoint_dir, 'checkpoint.pt'), final_model_path)
+    write_log(logger, f"FINAL - Saved final model to {final_model_path}")
+
+    # Log training summary
+    try:
+        pifi_logger = PiFiLogger.from_args(args)
+        pifi_logger.log_training_summary(
+            best_epoch=best_epoch_idx,
+            best_metric=abs(best_valid_objective_value),
+            best_metric_name=args.optimize_objective,
+            total_epochs=epoch_idx + 1
+        )
+    except Exception as e:
+        write_log(logger, f"Failed to save training summary: {e}")
 
     # Finish W&B run
     if args.use_wandb and wandb_mgr:
