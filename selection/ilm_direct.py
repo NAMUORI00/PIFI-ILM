@@ -14,10 +14,6 @@ try:
 except Exception:
     plt = None
     sns = None
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    SummaryWriter = None
 
 
 def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation',
@@ -441,7 +437,7 @@ def auto_select_layer(args) -> int:
     print(f"[selection] Saved selection to {out_path}")
     print(f"[selection] Best LLM layer: {best_llm_layer}")
 
-    # Optional logging to TensorBoard / W&B
+    # Optional logging to W&B
     try:
         _log_selection_results(args, effects, best_llm_layer, out_path,
                                n_samples=n_samples, n_pcs=n_pcs, top_pc=top_pc,
@@ -468,79 +464,7 @@ def _log_selection_results(args,
                            corr_mat: Optional[np.ndarray] = None,
                            hidden_per_layer: Optional[List[np.ndarray]] = None,
                            labels: Optional[np.ndarray] = None) -> None:
-    """Log ILM selection summary to TensorBoard and W&B (optional)."""
-    # TensorBoard
-    if getattr(args, 'use_tensorboard', False) and getattr(args, 'log_selection', True) and SummaryWriter is not None:
-        try:
-            log_dir = os.path.join(getattr(args, 'log_path', './tensorboard_logs'),
-                                   'selection', f"{args.task}_{args.task_dataset}_{args.model_type}_{args.llm_model}")
-            os.makedirs(log_dir, exist_ok=True)
-            writer = SummaryWriter(log_dir)
-            eff_np = np.array(effects, dtype=np.float32)
-            # Scalars per layer
-            for li, v in enumerate(eff_np):
-                writer.add_scalar('ILM/effect_per_layer', float(v), li)
-            # Histogram
-            writer.add_histogram('ILM/effects_hist', eff_np, 0)
-            # Line plot
-            if plt is not None:
-                fig_line, ax = plt.subplots(figsize=(8, 2.5))
-                ax.plot(list(range(len(eff_np))), eff_np, marker='o')
-                ax.axvline(best_llm_layer, color='r', linestyle='--', label=f'best={best_llm_layer}')
-                ax.set_title('ILM Effect per Layer (line)')
-                ax.set_xlabel('Layer'); ax.set_ylabel('Effect'); ax.legend(loc='upper right')
-                fig_line.tight_layout()
-                writer.add_figure('ILM/effects_line', fig_line, global_step=0)
-                plt.close(fig_line)
-            # Heatmap
-            if plt is not None and sns is not None:
-                fig_hm, ax = plt.subplots(figsize=(10, 2.0))
-                sns.heatmap([eff_np], cmap='viridis', cbar=True, xticklabels=list(range(len(eff_np))), yticklabels=['effect'], ax=ax)
-                ax.axvline(best_llm_layer + 0.5, color='r', linestyle='--')
-                ax.set_title('ILM Effect per Layer (heatmap)')
-                fig_hm.tight_layout()
-                writer.add_figure('ILM/effect_heatmap', fig_hm, global_step=0)
-                plt.close(fig_hm)
-            # Correlation heatmap (layers x PCs)
-            if corr_mat is not None and plt is not None and sns is not None:
-                fig_corr, ax = plt.subplots(figsize=(max(6, n_pcs/2), max(3, corr_mat.shape[0]/4)))
-                sns.heatmap(corr_mat, cmap='magma', cbar=True,
-                            xticklabels=list(range(n_pcs)),
-                            yticklabels=list(range(corr_mat.shape[0])), ax=ax)
-                ax.set_title('ILM Layer x PC Label-Correlation')
-                ax.set_xlabel('PC'); ax.set_ylabel('Layer')
-                fig_corr.tight_layout()
-                writer.add_figure('ILM/corr_heatmap', fig_corr, global_step=0)
-                plt.close(fig_corr)
-
-            # PCA scatter plots for selected layers
-            if getattr(args, 'log_selection_pca', True) and hidden_per_layer is not None and labels is not None and plt is not None:
-                sel_layers = _select_plot_layers(len(hidden_per_layer), best_llm_layer,
-                                                 getattr(args, 'selection_plot_layers', 'best,first,mid,last'),
-                                                 getattr(args, 'selection_plot_max_layers', 6))
-                for li in sel_layers:
-                    X = hidden_per_layer[li]
-                    pcs = min(2, X.shape[0], X.shape[1])
-                    if pcs < 2:
-                        continue
-                    S2, _ = _pca_scores(X, n_components=2)
-                    fig_sc, ax = plt.subplots(figsize=(4, 3))
-                    labs = np.array(labels)
-                    uniq = np.unique(labs)
-                    for c in uniq:
-                        idx = labs == c
-                        ax.scatter(S2[idx, 0], S2[idx, 1], s=8, alpha=0.7, label=str(int(c)))
-                    ax.set_xlabel('PC1'); ax.set_ylabel('PC2')
-                    ax.set_title(f'PCA Scatter - Layer {li}')
-                    ax.legend(markerscale=2, fontsize=7, loc='best', frameon=False)
-                    fig_sc.tight_layout()
-                    writer.add_figure(f'ILM/pca_scatter_layer_{li}', fig_sc, global_step=0)
-                    plt.close(fig_sc)
-
-            writer.flush(); writer.close()
-        except Exception as e:
-            print(f"[selection] TensorBoard logging error: {e}")
-
+    """Log ILM selection summary to W&B (optional)."""
     # W&B
     if getattr(args, 'use_wandb', False) and getattr(args, 'log_selection', True):
         try:

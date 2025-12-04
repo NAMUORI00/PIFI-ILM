@@ -10,10 +10,10 @@ from core.utils import (
     get_torch_device,
     TqdmLoggingHandler,
     write_log,
-    get_tb_exp_name,
     get_wandb_exp_name,
     get_huggingface_model_name,
     llm_layer,
+    worker_init_fn,
 )
 
 # Re-export parse_bool from core.arguments for backward compatibility
@@ -26,9 +26,9 @@ __all__ = [
     'get_torch_device',
     'TqdmLoggingHandler',
     'write_log',
-    'get_tb_exp_name',
     'get_wandb_exp_name',
     'get_huggingface_model_name',
     'llm_layer',
+    'worker_init_fn',
     'parse_bool',
 ]

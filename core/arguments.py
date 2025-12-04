@@ -73,8 +73,6 @@ class ArgParser():
         model_path_def = _env_or('PIFI_MODEL_PATH', f'{default_root}/models' if is_docker else f'/nas_homes/{self.user_name}/model_final/PiFi')
         checkpoint_path_def = _env_or('PIFI_CHECKPOINT_PATH', f'{default_root}/checkpoints' if is_docker else f'/nas_homes/{self.user_name}/model_checkpoint/PiFi')
         result_path_def = _env_or('PIFI_RESULT_PATH', f'{default_root}/results' if is_docker else f'/nas_homes/{self.user_name}/results/PiFi')
-        log_path_def = _env_or('PIFI_LOG_PATH', f'{default_root}/tensorboard_logs' if is_docker else f'/nas_homes/{self.user_name}/tensorboard_log/PiFi')
-
         self.parser.add_argument('--data_path', type=str, default=data_path_def,
                                  help='Path to the raw dataset before preprocessing')
         self.parser.add_argument('--cache_path', type=str, default=cache_path_def,
@@ -87,8 +85,6 @@ class ArgParser():
                                  help='Path to model checkpoints during training.')
         self.parser.add_argument('--result_path', type=str, default=result_path_def,
                                  help='Path to the result after testing.')
-        self.parser.add_argument('--log_path', type=str, default=log_path_def,
-                                 help='Path to the tensorboard log file.')
 
         # Model - Basic arguments
         self.parser.add_argument('--proj_name', type=str, default='PiFi',
@@ -157,14 +153,26 @@ class ArgParser():
                                  help='Stride for layer scoring (e.g., 2 scores every other layer); Default is 1')
         self.parser.add_argument('--selection_patch_lambda', type=str, default='0.5,1.0',
                                  help='Comma-separated lambdas for PC patching strength (e.g., "0.5,1.0"); Default is "0.5,1.0"')
-        self.parser.add_argument('--selection_pooling', type=str, choices=['first','mean'], default='first',
-                                 help='Pooling for hidden states when scoring layers: first token (CLS) or mean; Default is first')
+        self.parser.add_argument('--selection_pooling', type=str, choices=['first','mean'], default='mean',
+                                 help='Pooling for hidden states when scoring layers: first token (CLS) or mean; Default is mean')
         self.parser.add_argument('--selection_split', type=str, choices=['train','validation','test'], default='validation',
                                  help='Dataset split used for selection (task-specific mapping applied); Default is validation')
-        self.parser.add_argument('--selection_max_length', type=int, default=0,
-                                 help='Max token length for selection encoding (0 means use --max_seq_len or fallback to 128)')
-        self.parser.add_argument('--selection_dtype', type=str, choices=['fp16','fp32'], default='fp32',
-                                 help='LLM dtype for selection forward pass; Default is fp32')
+        self.parser.add_argument('--selection_max_length', type=int, default=128,
+                                 help='Max token length for selection encoding (set 0 to inherit --max_seq_len)')
+        self.parser.add_argument('--selection_dtype', type=str, choices=['fp16','fp32'], default='fp16',
+                                 help='LLM dtype for selection forward pass; Default is fp16 (uses fp32 on CPU)')
+        self.parser.add_argument('--selection_stratified', type=parse_bool, default=True,
+                                 help='Use stratified sampling for selection set; Default is True')
+        self.parser.add_argument('--selection_score_mode', type=str, choices=['mixed','probe','fisher','silhouette'], default='mixed',
+                                 help='Scoring mode for ILM selection; Default is mixed')
+        self.parser.add_argument('--selection_score_alpha', type=float, default=0.4,
+                                 help='Weight for probe score when mode=mixed; Default is 0.4')
+        self.parser.add_argument('--selection_score_beta', type=float, default=0.3,
+                                 help='Weight for fisher score when mode=mixed; Default is 0.3')
+        self.parser.add_argument('--selection_score_gamma', type=float, default=0.3,
+                                 help='Weight for silhouette score when mode=mixed; Default is 0.3')
+        self.parser.add_argument('--selection_depth_bias', type=float, default=0.3,
+                                 help='Depth penalty factor to de-bias deep layers; Default is 0.3')
 
         # Model - Optimizer & Scheduler arguments
         optim_list = ['SGD', 'AdaDelta', 'Adam', 'AdamW']
@@ -208,12 +216,10 @@ class ArgParser():
                                  help='Device to use for training; Default is cuda')
         self.parser.add_argument('--seed', type=int, default=2023,
                                  help='Random seed; Default is 2023')
-        self.parser.add_argument('--use_tensorboard', type=parse_bool, default=True,
-                                 help='Using tensorboard; Default is True')
         self.parser.add_argument('--use_wandb', type=parse_bool, default=True,
-                                 help='Using wandb; Default is True')
+                                 help='Using wandb for experiment tracking; Default is True')
         self.parser.add_argument('--log_selection', type=parse_bool, default=True,
-                                 help='Log ILM selection to TensorBoard/W&B when enabled; Default is True')
+                                 help='Log ILM selection results to W&B when enabled; Default is True')
         self.parser.add_argument('--log_selection_pca', type=parse_bool, default=True,
                                  help='Log per-layer PCA scatter plots during ILM selection; Default is True')
         self.parser.add_argument('--selection_plot_layers', type=str, default='best,first,mid,last',

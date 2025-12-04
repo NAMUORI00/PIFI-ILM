@@ -24,14 +24,53 @@ def check_path(path: str):
         os.makedirs(path)
 
 
-def set_random_seed(seed: int):
+def set_random_seed(seed: int, deterministic: bool = True):
     """
     Set random seed for reproducibility.
+
+    Args:
+        seed: Random seed value
+        deterministic: If True, enables deterministic algorithms (may impact performance)
     """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+    # Python random
     random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU
+
+    if deterministic:
+        # Enable deterministic algorithms
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        # PyTorch 1.8+ deterministic algorithms
+        if hasattr(torch, 'use_deterministic_algorithms'):
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass  # Some operations don't support deterministic mode
+
+        # cuBLAS deterministic mode (environment variable)
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+
+
+def worker_init_fn(worker_id: int):
+    """
+    Worker initialization function for DataLoader reproducibility.
+    Each worker gets a unique but deterministic seed.
+
+    Args:
+        worker_id: DataLoader worker ID
+    """
+    # Get base seed from PyTorch
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def get_torch_device(device: str):
@@ -97,31 +136,6 @@ def write_log(logger, message):
     """Write message to logger if logger exists"""
     if logger:
         logger.info(message)
-
-
-def get_tb_exp_name(args: argparse.Namespace):
-    """
-    Get the experiment name for tensorboard experiment.
-    """
-    ts = time.strftime('%Y-%b-%d-%H:%M:%S', time.localtime())
-
-    exp_name = str()
-    exp_name += "%s - " % args.task.upper()
-    exp_name += "%s - " % args.proj_name
-
-    if args.job in ['training', 'resume_training']:
-        exp_name += 'TRAIN - '
-        exp_name += "MODEL=%s - " % args.model_type.upper()
-        exp_name += "DATA=%s - " % args.task_dataset.upper()
-        exp_name += "DESC=%s - " % args.description
-    elif args.job == 'testing':
-        exp_name += 'TEST - '
-        exp_name += "MODEL=%s - " % args.model_type.upper()
-        exp_name += "DATA=%s - " % args.task_dataset.upper()
-        exp_name += "DESC=%s - " % args.description
-    exp_name += "TS=%s" % ts
-
-    return exp_name
 
 
 def get_wandb_exp_name(args: argparse.Namespace):
