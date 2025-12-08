@@ -68,6 +68,7 @@ def _build_ilm_args(
     llm_model: str,
     seed: int,
     logs_root: str,
+    selection_score_mode: str = "mixed",
 ) -> Namespace:
     """
     Build a minimal argparse.Namespace compatible with auto_select_layer().
@@ -90,6 +91,7 @@ def _build_ilm_args(
         max_seq_len=128,
         selection_dtype="fp16",
         selection_stratified=True,
+        selection_score_mode=selection_score_mode,
         # logging / paths
         use_wandb=False,
         log_selection=True,
@@ -103,7 +105,11 @@ def _build_ilm_args(
     )
 
 
-def evaluate_ilm_vs_sweep(logs_root: str, seed: int = 2023) -> None:
+def evaluate_ilm_vs_sweep(
+    logs_root: str,
+    seed: int = 2023,
+    selection_score_mode: str = "mixed",
+) -> None:
     """
     For each (task, dataset, model, llm) combo with sweep logs, run ILM selection
     and compare the selected layer against the sweep accuracies.
@@ -130,7 +136,15 @@ def evaluate_ilm_vs_sweep(logs_root: str, seed: int = 2023) -> None:
         print(f"[sweep] last layer: {last_layer} (acc={last_acc:.4f})")
 
         # Run ILM selection with current configuration
-        args = _build_ilm_args(task, dataset, model_type, llm_model, seed, logs_root)
+        args = _build_ilm_args(
+            task,
+            dataset,
+            model_type,
+            llm_model,
+            seed,
+            logs_root,
+            selection_score_mode=selection_score_mode,
+        )
         try:
             ilm_layer = auto_select_layer(args)
         except Exception as e:
@@ -213,9 +227,21 @@ def main():
         default=2023,
         help="Random seed to use for ILM selection (must match training if comparing fairly).",
     )
+    parser.add_argument(
+        "--selection_score_mode",
+        type=str,
+        default="ilm_pca",
+        choices=["ilm_pca", "mdl", "ilm_head_patching"],
+        help="Scoring mode to use for ILM selection when comparing against sweeps "
+             "(ilm_pca, mdl, or ilm_head_patching; default: ilm_pca).",
+    )
     args = parser.parse_args()
 
-    evaluate_ilm_vs_sweep(args.logs_root, seed=args.seed)
+    evaluate_ilm_vs_sweep(
+        args.logs_root,
+        seed=args.seed,
+        selection_score_mode=args.selection_score_mode,
+    )
 
 
 if __name__ == "__main__":
