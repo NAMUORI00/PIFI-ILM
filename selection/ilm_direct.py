@@ -1,322 +1,68 @@
 import os
-import json
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel, AutoConfig
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, silhouette_score
-try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-except Exception:
-    plt = None
-    sns = None
+from transformers import AutoConfig
 
 from core.wandb_manager import PiFiLogger
 
 
-def _resolve_dataset(task: str, dataset: str, n_samples: int, seed: int = 42, split: str = 'validation',
-                     stratified: bool = False) -> Tuple[List[str], List[int]]:
-    from datasets import load_dataset
+def _fisher_class_separation(*args, **kwargs):
+    """Deprecated alias kept for backward compatibility."""
+    from selection.scoring import fisher_class_separation
 
-    rng = np.random.default_rng(seed)
-    task = (task or "").lower()
-    name = (dataset or "").lower()
-    texts: List[str] = []
-    labels: List[int] = []
-
-    def take_subset(ds, text_key: str, label_key: str):
-        nonlocal texts, labels
-        n = min(n_samples, len(ds))
-        if stratified:
-            # balanced per-class sampling
-            # build indices per class
-            per_class = {}
-            for i in range(len(ds)):
-                item = ds[int(i)]
-                c = int(item[label_key])
-                per_class.setdefault(c, []).append(i)
-            if len(per_class) == 0:
-                return
-            k = len(per_class)
-            per_cls_n = max(1, n // k)
-            for c, arr in per_class.items():
-                take = min(per_cls_n, len(arr))
-                idx = rng.choice(arr, size=take, replace=False)
-                for j in idx:
-                    item = ds[int(j)]
-                    texts.append(str(item[text_key]))
-                    labels.append(int(item[label_key]))
-        else:
-            idx = rng.choice(len(ds), size=n, replace=False)
-            for i in idx:
-                item = ds[int(i)]
-                texts.append(str(item[text_key]))
-                labels.append(int(item[label_key]))
-
-    if name == "sst2":
-        # Prefer SetFit/sst2; fallback to GLUE sst2 with proper text key
-        try:
-            ds = load_dataset("SetFit/sst2")
-            chosen = ds.get(split if split in ds else "validation")
-            take_subset(chosen, "text", "label")
-        except Exception:
-            ds = load_dataset("glue", "sst2")
-            mapping = {"train":"train", "validation":"validation", "test":"test"}
-            chosen = ds[mapping.get(split, "validation")]
-            take_subset(chosen, "sentence", "label")
-    elif name == "imdb":
-        ds = load_dataset("imdb")
-        take_subset(ds["test"], "text", "label")
-    elif name == "cola":
-        ds = load_dataset("nyu-mll/glue", "cola")
-        take_subset(ds["validation"], "sentence", "label")
-    elif name == "tweet_offensive":
-        ds = load_dataset("cardiffnlp/tweet_eval", "offensive")
-        take_subset(ds["validation"], "text", "label")
-    elif name == "tweet_sentiment_binary":
-        ds = load_dataset("tweet_eval", name="sentiment")
-        val = ds["validation"]
-        filtered = [ex for ex in val if int(ex["label"]) != 1]
-        n = min(n_samples, len(filtered))
-        idx = rng.choice(len(filtered), size=n, replace=False)
-        for i in idx:
-            item = filtered[int(i)]
-            lab = 1 if int(item["label"]) == 2 else 0
-            texts.append(str(item["text"]))
-            labels.append(lab)
-    elif name == "mnli":
-        ds = load_dataset("glue", "mnli")
-        # Map generic split to mnli split name
-        split_map = {"train":"train", "validation":"validation_matched", "test":"validation_matched"}
-        val = ds[split_map.get(split, "validation_matched")]
-        n = min(n_samples, len(val))
-        idx = rng.choice(len(val), size=n, replace=False)
-        for i in idx:
-            item = val[int(i)]
-            texts.append(f"{item['premise']} [SEP] {item['hypothesis']}")
-            labels.append(int(item["label"]))
-    elif name == "snli":
-        ds = load_dataset("snli")
-        val = ds["validation"]
-        n = min(n_samples, len(val))
-        idx = rng.choice(len(val), size=n, replace=False)
-        for i in idx:
-            item = val[int(i)]
-            if int(item["label"]) == -1:
-                continue
-            texts.append(f"{item['premise']} [SEP] {item['hypothesis']}")
-            labels.append(int(item["label"]))
-    return texts, labels
+    return fisher_class_separation(*args, **kwargs)
 
 
-def _pool_hidden(hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
-    # Prefer first token; fallback to mean over unmasked tokens
-    if hidden.size(1) > 1:
-        if attention_mask is not None:
-            mask = attention_mask.float().unsqueeze(-1)
-            summed = (hidden * mask).sum(dim=1)
-            counts = mask.sum(dim=1).clamp(min=1e-6)
-            return summed / counts
-        else:
-            return hidden[:, 0]
-    else:
-        return hidden[:, 0]
+def _logit_probe_score(*args, **kwargs):
+    """Deprecated alias kept for backward compatibility."""
+    from selection.scoring import logit_probe_score
+
+    return logit_probe_score(*args, **kwargs)
 
 
-@torch.no_grad()
-def _get_llm_hidden_layers(llm_id: str, texts: List[str], device: str = "cuda", max_length: int = 128,
-                           batch_size: int = 16, dtype: Optional[torch.dtype] = None, pooling: str = 'first',
-                           l2_norm: bool = True) -> List[np.ndarray]:
-    tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
-    model = AutoModel.from_pretrained(llm_id)
-    if device == "cuda" and torch.cuda.is_available():
-        if dtype is None:
-            dtype = torch.float16
-        model = model.to(device=device, dtype=dtype)
-    else:
-        device = "cpu"
-        model = model.to(device)
-    model.eval()
+def _robust_probe_score(*args, **kwargs):
+    """Deprecated alias kept for backward compatibility."""
+    from selection.scoring import robust_probe_score
 
-    all_layers: List[np.ndarray] = []
-    # First pass to determine number of layers
-    enc0 = tokenizer(texts[:1], padding=True, truncation=True, max_length=max_length, return_tensors="pt")
-    enc0 = {k: v.to(device) for k, v in enc0.items()}
-    out0 = model(**enc0, output_hidden_states=True)
-    n_layers_total = len(out0.hidden_states) - 1  # exclude embeddings
-    all_layers = [np.empty((0, out0.hidden_states[-1].size(-1)), dtype=np.float32) for _ in range(n_layers_total)]
-
-    # Batch through texts
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i:i+batch_size]
-        enc = tokenizer(batch_texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
-        enc = {k: v.to(device) for k, v in enc.items()}
-        out = model(**enc, output_hidden_states=True)
-        hs = list(out.hidden_states)[1:]  # skip embeddings
-        for li, h in enumerate(hs):
-            if pooling == 'first':
-                pooled = h[:, 0]
-            else:
-                pooled = _pool_hidden(h, enc.get("attention_mask"))
-            pooled_np = pooled.detach().float().cpu().numpy()
-            if l2_norm:
-                norm = np.linalg.norm(pooled_np, axis=1, keepdims=True)
-                pooled_np = pooled_np / np.maximum(norm, 1e-8)
-            all_layers[li] = np.vstack([all_layers[li], pooled_np])
-    return all_layers
+    return robust_probe_score(*args, **kwargs)
 
 
-def _pca_scores(X: np.ndarray, n_components: int) -> Tuple[np.ndarray, np.ndarray]:
-    pca = PCA(n_components=n_components, svd_solver="auto", random_state=0)
-    S = pca.fit_transform(X)
-    comps = pca.components_
-    return S, comps
+def _rerank_topk(*args, **kwargs):
+    """Deprecated alias kept for backward compatibility."""
+    from selection.scoring import rerank_topk
+
+    return rerank_topk(*args, **kwargs)
 
 
-def _label_correlation(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
-    y = np.asarray(y)
-    if len(np.unique(y)) <= 2:
-        yv = y.astype(float)
-        corrs = []
-        for j in range(scores.shape[1]):
-            s = scores[:, j]
-            if s.std() < 1e-8 or yv.std() < 1e-8:
-                corrs.append(0.0)
-            else:
-                corrs.append(abs(np.corrcoef(s, yv)[0, 1]))
-        return np.array(corrs)
-    else:
-        K = int(np.max(y)) + 1
-        corrs = []
-        for j in range(scores.shape[1]):
-            s = scores[:, j]
-            vals = []
-            for k in range(K):
-                yk = (y == k).astype(float)
-                if s.std() < 1e-8 or yk.std() < 1e-8:
-                    vals.append(0.0)
-                else:
-                    vals.append(abs(np.corrcoef(s, yk)[0, 1]))
-            corrs.append(max(vals))
-        return np.array(corrs)
+def _compute_score_for_layer(
+    X: np.ndarray,
+    y: np.ndarray,
+    mode: str,
+    alpha: float,
+    seed: int,
+    n_folds: int = 5,
+    n_seeds: int = 3,
+    use_confidence_weight: bool = False,
+) -> float:
+    """Thin wrapper delegating to selection.scoring.compute_score_for_layer."""
+    from selection.scoring import compute_score_for_layer as _core_compute
 
-
-def _probe_effect(original: np.ndarray, patched: np.ndarray, y: np.ndarray) -> float:
-    clf = LogisticRegression(max_iter=1000, n_jobs=1)
-    clf.fit(original, y)
-    acc0 = accuracy_score(y, clf.predict(original))
-    acc1 = accuracy_score(y, clf.predict(patched))
-    return float(max(0.0, acc0 - acc1))
-
-
-def _ilm_effect_for_layer(X: np.ndarray, y: np.ndarray, n_pcs: int, top_pc: int, lambdas: Tuple[float, ...]) -> float:
-    scores, comps = _pca_scores(X, n_components=n_pcs)
-    corrs = _label_correlation(scores, y)
-    idx = np.argsort(-corrs)[:max(1, min(top_pc, n_pcs))]
-    best = 0.0
-    S_sel = scores[:, idx]
-    U = comps[idx]  # (r, dim)
-    recon = S_sel @ U  # (n, dim)
-    for lam in lambdas:
-        X_cf = X - lam * recon
-        eff = _probe_effect(X, X_cf, y)
-        best = max(best, eff)
-    return best
-
-
-def _fisher_class_separation(X: np.ndarray, y: np.ndarray) -> float:
-    """Class separation score: inter-centroid distance / intra-class variance."""
-    X = np.asarray(X, dtype=np.float32)
-    y = np.asarray(y)
-    classes = np.unique(y)
-    if len(classes) < 2 or X.shape[0] == 0:
-        return 0.0
-    centroids = {}
-    within = 0.0
-    for c in classes:
-        Xc = X[y == c]
-        if len(Xc) == 0:
-            continue
-        mu = Xc.mean(axis=0)
-        centroids[c] = mu
-        var = ((Xc - mu) ** 2).sum(axis=1).mean()
-        within += float(var)
-    within = max(within, 1e-6)
-    if len(centroids) < 2:
-        return 0.0
-    # inter-class: mean pairwise centroid distance^2
-    inter_dists = []
-    c_list = list(centroids.keys())
-    for i in range(len(c_list)):
-        for j in range(i + 1, len(c_list)):
-            inter_dists.append(float(np.linalg.norm(centroids[c_list[i]] - centroids[c_list[j]]) ** 2))
-    if len(inter_dists) == 0:
-        return 0.0
-    inter = float(np.mean(inter_dists))
-    return inter / within
-
-
-def _logit_probe_score(X: np.ndarray, y: np.ndarray, seed: int = 0) -> float:
-    """Lightweight linear probe accuracy as a proxy for downstream performance."""
-    X = np.asarray(X, dtype=np.float32)
-    y = np.asarray(y)
-    classes = np.unique(y)
-    if len(classes) < 2 or X.shape[0] < 10:
-        return 0.0
-    rng = np.random.default_rng(seed)
-    train_idx = []
-    val_idx = []
-    for c in classes:
-        idx = np.where(y == c)[0]
-        if len(idx) == 0:
-            continue
-        rng.shuffle(idx)
-        cut = max(1, int(0.8 * len(idx)))
-        train_idx.extend(idx[:cut])
-        val_idx.extend(idx[cut:])
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        return 0.0
-    clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class='auto')
-    clf.fit(X[train_idx], y[train_idx])
-    acc = accuracy_score(y[val_idx], clf.predict(X[val_idx]))
-    return float(acc)
-
-
-def _rerank_topk(candidates: List[int], scores: List[float]) -> int:
-    """Return best layer from candidates using provided scores."""
-    best_idx = int(np.argmax(scores))
-    return int(candidates[best_idx])
-
-
-def _compute_score_for_layer(X: np.ndarray, y: np.ndarray, mode: str, alpha: float, seed: int) -> float:
-    """Unified scoring: probe / fisher / silhouette / mixed."""
-    mode = (mode or "probe").lower()
-    probe = _logit_probe_score(X, y, seed=seed)
-    sil = 0.0
-    try:
-        sil = float(silhouette_score(X, y)) if len(np.unique(y)) > 1 and X.shape[0] > len(np.unique(y)) else 0.0
-    except Exception:
-        sil = 0.0
-    if mode == "probe":
-        return probe
-    fisher = _fisher_class_separation(X, y)
-    if mode == "fisher":
-        return fisher
-    if mode == "silhouette":
-        return sil
-    # mixed: combine probe, fisher, silhouette
-    alpha = float(alpha)
     beta = float(getattr(_compute_score_for_layer, "_beta", 0.3))
     gamma = float(getattr(_compute_score_for_layer, "_gamma", 0.3))
-    total = alpha + beta + gamma
-    if total <= 0:
-        return probe
-    alpha /= total; beta /= total; gamma /= total
-    return alpha * probe + beta * fisher + gamma * sil
+    return _core_compute(
+        X,
+        y,
+        mode=mode,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+        seed=seed,
+        n_folds=n_folds,
+        n_seeds=n_seeds,
+        use_confidence_weight=use_confidence_weight,
+    )
 
 
 def auto_select_layer(args) -> int:
@@ -357,34 +103,63 @@ def auto_select_layer(args) -> int:
     _compute_score_for_layer._beta = score_beta
     _compute_score_for_layer._gamma = score_gamma
 
+    # Robust selection parameters (K-fold CV + multi-seed + selectivity)
+    robust_selection = str(getattr(args, "robust_selection", False)).lower() in ("true", "1", "yes")
+    selection_n_folds = int(getattr(args, "selection_n_folds", 5))
+    selection_n_seeds = int(getattr(args, "selection_n_seeds", 3))
+    # Confidence weighting is OFF by default (pure selectivity, no heuristic)
+    use_confidence_weight = str(getattr(args, "selection_use_confidence_weight", False)).lower() in ("true", "1", "yes")
+    if robust_selection:
+        score_mode = "robust"
+        conf_msg = "+ confidence weight" if use_confidence_weight else "(pure selectivity)"
+        print(f"[selection] Robust mode enabled: {selection_n_folds}-fold CV x {selection_n_seeds} seeds {conf_msg}")
+
     # Resolve huggingface model id for LLM
     from core.utils import get_huggingface_model_name
+
     llm_id = get_huggingface_model_name(llm_type)
 
     # Collect data
-    texts, labels = _resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=stratified)
+    from selection.data import resolve_dataset
+
+    texts, labels = resolve_dataset(
+        task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=stratified
+    )
     if len(texts) < 10:
         print("[selection] Not enough samples; defaulting to mid layer")
         cfg = AutoConfig.from_pretrained(llm_id)
         return max(0, cfg.num_hidden_layers // 2)
 
     # Collect pooled hidden per layer for LLM
+    from selection.embeddings import get_llm_hidden_layers
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if (dtype_pref == 'fp16' and device == 'cuda') else torch.float32
-    hidden_per_layer = _get_llm_hidden_layers(llm_id, texts, device=device, max_length=sel_max_len, batch_size=16, dtype=dtype, pooling=pooling, l2_norm=True)
+    dtype = torch.float16 if (dtype_pref == "fp16" and device == "cuda") else torch.float32
+    hidden_per_layer = get_llm_hidden_layers(
+        llm_id,
+        texts,
+        device=device,
+        max_length=sel_max_len,
+        batch_size=16,
+        dtype=dtype,
+        pooling=pooling,
+        l2_norm=True,
+    )
     y = np.array(labels)
 
     depth_bias = float(getattr(args, "selection_depth_bias", 0.3))
     num_layers = len(hidden_per_layer)
 
-    # 1st stage: coarse scoring (logit probe)
+    # 1st stage: coarse scoring (logit probe or robust probe)
     effects: List[float] = []
     for Li, X in enumerate(hidden_per_layer):
         if stride > 1 and (Li % stride != 0):
             effects.append(0.0)
             continue
         try:
-            eff = _compute_score_for_layer(X, y, mode=score_mode, alpha=score_alpha, seed=seed)
+            eff = _compute_score_for_layer(X, y, mode=score_mode, alpha=score_alpha, seed=seed,
+                                           n_folds=selection_n_folds, n_seeds=selection_n_seeds,
+                                           use_confidence_weight=use_confidence_weight)
         except Exception as e:
             print(f"[selection] LLM layer {Li} scoring failed: {e}; using 0")
             eff = 0.0
@@ -395,9 +170,11 @@ def auto_select_layer(args) -> int:
     # Top-k rerank with same score (lightweight)
     k = int(getattr(args, "selection_topk_rerank", 3))
     eff_np = np.array(effects)
-    top_idx = np.argsort(-eff_np)[:max(1, k)]
+    top_idx = np.argsort(-eff_np)[: max(1, k)]
     top_scores = eff_np[top_idx]
-    best_llm_layer = _rerank_topk(list(top_idx), list(top_scores))
+    from selection.scoring import rerank_topk
+
+    best_llm_layer = rerank_topk(list(top_idx), list(top_scores))
 
     # Compute layer x PC correlation matrix for visualization (no extra forward pass)
     corr_mat = None
@@ -405,12 +182,14 @@ def auto_select_layer(args) -> int:
         corr_rows: List[np.ndarray] = []
         for X in hidden_per_layer:
             # Guard against tiny sample sizes
+            from selection.scoring import pca_scores, label_correlation
+
             pcs = min(n_pcs, X.shape[0], X.shape[1])
             if pcs <= 0:
                 corr_rows.append(np.zeros((n_pcs,), dtype=np.float32))
                 continue
-            S, comps = _pca_scores(X, n_components=pcs)
-            corrs = _label_correlation(S, y)
+            S, comps = pca_scores(X, n_components=pcs)
+            corrs = label_correlation(S, y)
             # Pad/trim to n_pcs for consistent heatmap width
             row = np.zeros((n_pcs,), dtype=np.float32)
             row[:pcs] = corrs[:pcs]
@@ -524,64 +303,15 @@ def _create_selection_figures(effects: List[float], best_layer: int,
     if plt is None:
         return {}
 
-    figures = {}
+    from selection.visualization import create_selection_figures as _viz_create
 
-    # Line plot
-    fig_line, ax = plt.subplots(figsize=(8, 2.5))
-    ax.plot(list(range(len(effects))), effects, marker='o')
-    if best_layer >= 0:
-        ax.axvline(best_layer, color='r', linestyle='--', label=f'best={best_layer}')
-        ax.legend(loc='upper right')
-    ax.set_title('ILM Effect per Layer (line)')
-    ax.set_xlabel('Layer')
-    ax.set_ylabel('Effect')
-    fig_line.tight_layout()
-    figures['effect_line'] = fig_line
-
-    # Heatmap of effects
-    if sns is not None:
-        fig_hm, ax = plt.subplots(figsize=(10, 2.0))
-        sns.heatmap([effects], cmap='viridis', cbar=True,
-                    xticklabels=list(range(len(effects))), yticklabels=['effect'], ax=ax)
-        if best_layer >= 0:
-            ax.axvline(best_layer + 0.5, color='r', linestyle='--')
-        ax.set_title('ILM Effect per Layer (heatmap)')
-        fig_hm.tight_layout()
-        figures['effect_heatmap'] = fig_hm
-
-    # Correlation heatmap (layers x PCs)
-    if corr_mat is not None and sns is not None:
-        fig_corr, ax = plt.subplots(figsize=(max(6, n_pcs/2), max(3, corr_mat.shape[0]/4)))
-        sns.heatmap(corr_mat, cmap='magma', cbar=True,
-                    xticklabels=list(range(n_pcs)),
-                    yticklabels=list(range(corr_mat.shape[0])), ax=ax)
-        ax.set_title('ILM Layer x PC Label-Correlation')
-        ax.set_xlabel('PC')
-        ax.set_ylabel('Layer')
-        fig_corr.tight_layout()
-        figures['corr_heatmap'] = fig_corr
-
-    # PCA scatter plots for selected layers
-    if hidden_per_layer is not None and labels is not None:
-        sel_layers = _select_plot_layers(len(hidden_per_layer), best_layer,
-                                         plot_layers_spec, max_layers)
-        for li in sel_layers:
-            X = hidden_per_layer[li]
-            pcs = min(2, X.shape[0], X.shape[1])
-            if pcs < 2:
-                continue
-            S2, _ = _pca_scores(X, n_components=2)
-            fig_sc, ax = plt.subplots(figsize=(4, 3))
-            labs = np.array(labels)
-            uniq = np.unique(labs)
-            for c in uniq:
-                idx = labs == c
-                ax.scatter(S2[idx, 0], S2[idx, 1], s=8, alpha=0.7, label=str(int(c)))
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-            ax.set_title(f'PCA Scatter - Layer {li}')
-            ax.legend(markerscale=2, fontsize=7, loc='best', frameon=False)
-            fig_sc.tight_layout()
-            figures[f'pca_scatter_layer_{li}'] = fig_sc
-
-    return figures
+    return _viz_create(
+        effects,
+        best_layer,
+        n_pcs,
+        corr_mat=corr_mat,
+        hidden_per_layer=hidden_per_layer,
+        labels=labels,
+        plot_layers_spec=plot_layers_spec,
+        max_layers=max_layers,
+    )
