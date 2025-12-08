@@ -55,3 +55,6 @@ dataset/
 .DS_Store
 .idea/
 .vscode/
+
+# Comparison artifacts
+.compare/
