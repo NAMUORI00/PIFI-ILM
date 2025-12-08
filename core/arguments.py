@@ -179,26 +179,16 @@ class ArgParser():
                                  help='LLM dtype for selection forward pass; Default is fp16 (uses fp32 on CPU)')
         self.parser.add_argument('--selection_stratified', type=parse_bool, default=True,
                                  help='Use stratified sampling for selection set; Default is True')
-        self.parser.add_argument('--selection_score_mode', type=str, choices=['mixed','probe','fisher','silhouette','robust'], default='mixed',
-                                 help='Scoring mode for ILM selection; Default is mixed')
-        self.parser.add_argument('--selection_score_alpha', type=float, default=0.4,
-                                 help='Weight for probe score when mode=mixed; Default is 0.4')
-        self.parser.add_argument('--selection_score_beta', type=float, default=0.3,
-                                 help='Weight for fisher score when mode=mixed; Default is 0.3')
-        self.parser.add_argument('--selection_score_gamma', type=float, default=0.3,
-                                 help='Weight for silhouette score when mode=mixed; Default is 0.3')
-        self.parser.add_argument('--selection_depth_bias', type=float, default=0.3,
-                                 help='Depth penalty factor to de-bias deep layers; Default is 0.3')
-
-        # Robust selection parameters (K-fold CV + multi-seed + selectivity)
-        self.parser.add_argument('--robust_selection', type=parse_bool, default=False,
-                                 help='Use robust probe with K-fold CV, multi-seed averaging, and selectivity score; Default is False')
-        self.parser.add_argument('--selection_n_folds', type=int, default=5,
-                                 help='Number of CV folds for robust selection; Default is 5')
-        self.parser.add_argument('--selection_n_seeds', type=int, default=3,
-                                 help='Number of seeds for multi-seed averaging in robust selection; Default is 3')
-        self.parser.add_argument('--selection_use_confidence_weight', type=parse_bool, default=False,
-                                 help='Apply confidence weighting in robust mode (empirical heuristic); Default is False (pure selectivity)')
+        self.parser.add_argument('--selection_score_mode', type=str,
+                                 choices=['ilm_pca', 'mdl', 'ilm_head_patching'],
+                                 default='ilm_pca',
+                                 help='Scoring mode for ILM selection: '
+                                      'ilm_pca (PC-label correlation), '
+                                      'mdl (Minimum Description Length), '
+                                      'ilm_head_patching (head-level PC patching for Qwen2); '
+                                      'Default is ilm_pca')
+        self.parser.add_argument('--mdl_n_portions', type=int, default=10,
+                                 help='Number of portions for MDL online coding; Default is 10')
 
         # Model - Optimizer & Scheduler arguments
         optim_list = ['SGD', 'AdaDelta', 'Adam', 'AdamW']

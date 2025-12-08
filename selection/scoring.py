@@ -1,19 +1,30 @@
+"""Layer selection scoring functions.
+
+Only two methods are supported:
+1. ILM-PCA: PC-label correlation (Sun et al., ACL 2025 inspired)
+2. MDL: Minimum Description Length (Voita & Titov, EMNLP 2020)
+"""
 from typing import List, Tuple
 
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, silhouette_score
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+# Suppress sklearn convergence warnings in scoring utilities
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 
 def pca_scores(X: np.ndarray, n_components: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply PCA and return scores and components."""
     pca = PCA(n_components=n_components, svd_solver="auto", random_state=0)
     S = pca.fit_transform(X)
-    comps = pca.components_
-    return S, comps
+    return S, pca.components_
 
 
 def label_correlation(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Compute absolute correlation between PC scores and labels."""
     y = np.asarray(y)
     if len(np.unique(y)) <= 2:
         yv = y.astype(float)
@@ -26,6 +37,7 @@ def label_correlation(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
                 corrs.append(abs(np.corrcoef(s, yv)[0, 1]))
         return np.array(corrs)
 
+    # Multi-class: max correlation across one-vs-rest
     K = int(np.max(y)) + 1
     corrs = []
     for j in range(scores.shape[1]):
@@ -41,173 +53,152 @@ def label_correlation(scores: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.array(corrs)
 
 
-def fisher_class_separation(X: np.ndarray, y: np.ndarray) -> float:
-    """Class separation score: inter-centroid distance / intra-class variance."""
+def ilm_pca_score(
+    X: np.ndarray, y: np.ndarray, n_pcs: int = 16, top_pc: int = 5
+) -> float:
+    """
+    ILM-inspired PCA score: average label-correlation of top PCs.
+
+    For a given layer representation X, we:
+      1) run PCA to get PC scores per sample,
+      2) measure correlation between each PC score and labels,
+      3) return the mean correlation of the top-k PCs.
+
+    This approximates how strongly input-label mappings are encoded
+    in a small subspace of the layer representation.
+
+    References:
+        Sun et al. (ACL 2025) - Interpret and Improve ICL via Input-Label Mappings
+    """
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y)
-    classes = np.unique(y)
-    if len(classes) < 2 or X.shape[0] == 0:
+
+    if X.ndim != 2 or X.shape[0] < 10 or X.shape[1] == 0:
         return 0.0
-    centroids = {}
-    within = 0.0
-    for c in classes:
-        Xc = X[y == c]
-        if len(Xc) == 0:
-            continue
-        mu = Xc.mean(axis=0)
-        centroids[c] = mu
-        var = ((Xc - mu) ** 2).sum(axis=1).mean()
-        within += float(var)
-    within = max(within, 1e-6)
-    if len(centroids) < 2:
+
+    pcs = min(n_pcs, X.shape[0], X.shape[1])
+    if pcs <= 0:
         return 0.0
-    inter_dists = []
-    c_list = list(centroids.keys())
-    for i in range(len(c_list)):
-        for j in range(i + 1, len(c_list)):
-            inter_dists.append(float(np.linalg.norm(centroids[c_list[i]] - centroids[c_list[j]]) ** 2))
-    if not inter_dists:
+
+    try:
+        S, _ = pca_scores(X, n_components=pcs)
+    except Exception:
         return 0.0
-    inter = float(np.mean(inter_dists))
-    return inter / within
+
+    corrs = label_correlation(S, y)
+    if corrs.size == 0:
+        return 0.0
+
+    k = min(top_pc, corrs.size)
+    top_corrs = np.sort(corrs)[-k:]
+    return float(np.mean(top_corrs))
 
 
-def logit_probe_score(X: np.ndarray, y: np.ndarray, seed: int = 0) -> float:
-    """Lightweight linear probe accuracy as a proxy for downstream performance."""
+def online_coding_mdl(
+    X: np.ndarray, y: np.ndarray, n_portions: int = 10, seed: int = 0
+) -> float:
+    """
+    Online Coding MDL score (Voita & Titov 2020).
+
+    Computes the average codelength per sample using online coding:
+    - Data is split into n_portions
+    - First portion uses uniform code (no model)
+    - Subsequent portions use model trained on all previous data
+
+    Lower codelength = better layer (more efficient encoding).
+
+    References:
+        Voita & Titov (EMNLP 2020) - Information-Theoretic Probing with MDL
+    """
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y)
-    classes = np.unique(y)
-    if len(classes) < 2 or X.shape[0] < 10:
-        return 0.0
+    n = len(y)
+
+    if n < 20:
+        return float("inf")
+
     rng = np.random.default_rng(seed)
-    train_idx = []
-    val_idx = []
-    for c in classes:
-        idx = np.where(y == c)[0]
-        if len(idx) == 0:
+    idx = rng.permutation(n)
+    X, y = X[idx], y[idx]
+
+    portion_size = n // n_portions
+    if portion_size < 2:
+        return float("inf")
+
+    total_codelength = 0.0
+    n_classes = len(np.unique(y))
+
+    # First portion: uniform code (no model)
+    first_portion_cost = portion_size * np.log2(max(n_classes, 2))
+    total_codelength += first_portion_cost
+
+    # Online coding for remaining portions
+    for i in range(1, n_portions):
+        train_end = i * portion_size
+        test_start = train_end
+        test_end = (i + 1) * portion_size if i < n_portions - 1 else n
+
+        X_train, y_train = X[:train_end], y[:train_end]
+        X_test, y_test = X[test_start:test_end], y[test_start:test_end]
+
+        if len(X_test) == 0:
             continue
-        rng.shuffle(idx)
-        cut = max(1, int(0.8 * len(idx)))
-        train_idx.extend(idx[:cut])
-        val_idx.extend(idx[cut:])
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        return 0.0
-    clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto")
-    clf.fit(X[train_idx], y[train_idx])
-    acc = accuracy_score(y[val_idx], clf.predict(X[val_idx]))
-    return float(acc)
 
+        try:
+            clf = LogisticRegression(max_iter=300, random_state=seed, n_jobs=1)
+            clf.fit(X_train, y_train)
+            probs = clf.predict_proba(X_test)
 
-def robust_probe_score(
-    X: np.ndarray,
-    y: np.ndarray,
-    n_folds: int = 5,
-    n_seeds: int = 3,
-    use_selectivity: bool = True,
-) -> Tuple[float, float]:
-    """K-fold + multi-seed probe with optional selectivity."""
-    from sklearn.model_selection import StratifiedKFold
+            for j, true_label in enumerate(y_test):
+                label_idx = list(clf.classes_).index(true_label)
+                prob = max(probs[j, label_idx], 1e-10)
+                total_codelength += -np.log2(prob)
+        except Exception:
+            # Fallback to uniform code
+            total_codelength += len(y_test) * np.log2(max(n_classes, 2))
 
-    X = np.asarray(X, dtype=np.float32)
-    y = np.asarray(y)
-    classes = np.unique(y)
-    if len(classes) < 2 or X.shape[0] < 20:
-        return 0.0, 0.0
-
-    all_accs: List[float] = []
-    all_random_accs: List[float] = []
-    all_confidences: List[float] = []
-
-    for seed in range(n_seeds):
-        rng = np.random.default_rng(seed)
-        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-
-        for train_idx, val_idx in skf.split(X, y):
-            clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto", random_state=seed)
-            clf.fit(X[train_idx], y[train_idx])
-
-            probs = clf.predict_proba(X[val_idx])
-            preds = clf.predict(X[val_idx])
-            acc = accuracy_score(y[val_idx], preds)
-            conf = float(np.mean(np.max(probs, axis=1)))
-
-            all_accs.append(acc)
-            all_confidences.append(conf)
-
-            if use_selectivity:
-                y_train_random = rng.permutation(y[train_idx])
-                clf_rand = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto", random_state=seed)
-                try:
-                    clf_rand.fit(X[train_idx], y_train_random)
-                    y_val_random = rng.permutation(y[val_idx])
-                    acc_rand = accuracy_score(y_val_random, clf_rand.predict(X[val_idx]))
-                    all_random_accs.append(acc_rand)
-                except Exception:
-                    pass
-
-    mean_acc = float(np.mean(all_accs)) if all_accs else 0.0
-    mean_conf = float(np.mean(all_confidences)) if all_confidences else 0.0
-
-    if use_selectivity and all_random_accs:
-        mean_random = float(np.mean(all_random_accs))
-        selectivity = max(0.0, mean_acc - mean_random)
-        return selectivity, mean_conf
-
-    return mean_acc, mean_conf
+    return total_codelength / n
 
 
 def compute_score_for_layer(
     X: np.ndarray,
     y: np.ndarray,
-    mode: str,
-    alpha: float,
-    beta: float,
-    gamma: float,
-    seed: int,
-    n_folds: int = 5,
-    n_seeds: int = 3,
-    use_confidence_weight: bool = False,
+    mode: str = "ilm_pca",
+    n_pcs: int = 16,
+    top_pc: int = 5,
+    mdl_n_portions: int = 10,
+    seed: int = 0,
 ) -> float:
     """
-    Unified scoring: probe / fisher / silhouette / mixed / robust.
+    Compute layer selection score.
+
+    Args:
+        X: Hidden representations (n_samples, hidden_dim)
+        y: Labels (n_samples,)
+        mode: "ilm_pca" or "mdl"
+        n_pcs: Number of PCs for ILM-PCA
+        top_pc: Top-k PCs to average for ILM-PCA
+        mdl_n_portions: Number of portions for MDL online coding
+        seed: Random seed
+
+    Returns:
+        Score (higher is better for all modes)
     """
-    mode = (mode or "probe").lower()
+    mode = (mode or "ilm_pca").lower()
 
-    if mode == "robust":
-        score, conf = robust_probe_score(X, y, n_folds=n_folds, n_seeds=n_seeds, use_selectivity=True)
-        if use_confidence_weight:
-            return score * (0.5 + 0.5 * conf)
-        return score
+    if mode == "ilm_pca":
+        return ilm_pca_score(X, y, n_pcs=n_pcs, top_pc=top_pc)
 
-    probe = logit_probe_score(X, y, seed=seed)
-    sil = 0.0
-    try:
-        sil = float(silhouette_score(X, y)) if len(np.unique(y)) > 1 and X.shape[0] > len(np.unique(y)) else 0.0
-    except Exception:
-        sil = 0.0
-    if mode == "probe":
-        return probe
+    if mode == "mdl":
+        # Lower MDL = better -> negate for argmax
+        mdl = online_coding_mdl(X, y, n_portions=mdl_n_portions, seed=seed)
+        return -mdl
 
-    fisher = fisher_class_separation(X, y)
-    if mode == "fisher":
-        return fisher
-    if mode == "silhouette":
-        return sil
-
-    alpha = float(alpha)
-    beta = float(beta)
-    gamma = float(gamma)
-    total = alpha + beta + gamma
-    if total <= 0:
-        return probe
-    alpha /= total
-    beta /= total
-    gamma /= total
-    return alpha * probe + beta * fisher + gamma * sil
+    # Fallback to ilm_pca
+    return ilm_pca_score(X, y, n_pcs=n_pcs, top_pc=top_pc)
 
 
 def rerank_topk(candidates: List[int], scores: List[float]) -> int:
     """Return best layer from candidates using provided scores."""
     best_idx = int(np.argmax(scores))
     return int(candidates[best_idx])
-
