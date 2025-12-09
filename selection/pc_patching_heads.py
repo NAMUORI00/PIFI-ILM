@@ -13,6 +13,8 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 
 from selection.data import resolve_dataset
+from selection.prompts import build_label_prompts
+from selection.label_embeddings import get_label_token_hidden_per_layer
 from selection.qwen2_pc_patching import (
     ILMHeadPatchState,
     Qwen2HeadPatchContext,
@@ -70,13 +72,30 @@ def run_qwen2_head_pc_patching(
     n_pcs: int = 4,
     top_pc: int = 2,
     seed: int = 2023,
+    k_shot: int = 1,
+    prompt_max_length: int = 256,
 ) -> Dict[str, np.ndarray]:
     """
     Full ILM-style PC patching pipeline for Qwen2 attention heads.
-    """
-    texts, labels = resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=True)
-    y = np.asarray(labels)
 
+    Steps:
+      1) Sample (texts, labels) for the given task/dataset.
+      2) Baseline pass with patched Qwen2 attention to COLLECT per-layer/head vectors.
+      3) For each (layer, head), run PCA over collected vectors to obtain ILM PCs.
+      4) Baseline pass (no patch) to get final-layer pooled representations and train a probe.
+      5) For each (layer, head), enable PC patching and re-run forward to measure probe accuracy drop.
+
+    Returns:
+        dict with:
+          - \"head_importance\": np.ndarray (num_layers, num_heads)
+          - \"base_acc\": float
+    """
+    # 1) Resolve data
+    texts, labels = resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=True)
+    prompts, label_token_strs, prompt_labels = build_label_prompts(texts, labels, k_shot=k_shot)
+    y = np.asarray(prompt_labels)
+
+    # 2) Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
     model = AutoModel.from_pretrained(llm_id)
     if device == "cuda" and torch.cuda.is_available():
@@ -90,16 +109,17 @@ def run_qwen2_head_pc_patching(
     num_heads = model.layers[0].self_attn.num_heads
 
     with Qwen2HeadPatchContext():
+        # 2) Baseline pass to COLLECT per-head vectors
         reset_collection()
         start_collection()
 
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
+        for i in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[i : i + batch_size]
             enc = tokenizer(
-                batch_texts,
+                batch_prompts,
                 padding=True,
                 truncation=True,
-                max_length=max_length,
+                max_length=prompt_max_length,
                 return_tensors="pt",
             )
             enc = {k: v.to(device) for k, v in enc.items()}
@@ -107,12 +127,14 @@ def run_qwen2_head_pc_patching(
 
         stop_collection()
 
+        # 3) Compute ILM PCs per (layer, head)
         head_pcs: Dict[Tuple[int, int], np.ndarray] = {}
 
         for layer_idx in range(num_layers):
             bucket = STATE.collected.get(layer_idx, [])
             if not bucket:
                 continue
+            # bucket: list of (num_heads, head_dim)
             H = np.stack(bucket, axis=0)  # (N, num_heads, head_dim)
             N, Hn, D = H.shape
             assert Hn == num_heads
@@ -128,6 +150,7 @@ def run_qwen2_head_pc_patching(
                     S = pca.fit_transform(vecs)
                 except Exception:
                     continue
+                # Simple label-correlation to select top PCs
                 from selection.scoring import label_correlation
 
                 corrs = label_correlation(S, y[: S.shape[0]])
@@ -138,31 +161,29 @@ def run_qwen2_head_pc_patching(
                 pcs = pca.components_[idxs]  # (k_top, D)
                 head_pcs[(layer_idx, h)] = pcs.astype(np.float32)
 
+        # Debug: report how many heads obtained ILM PCs
         if not head_pcs:
             print("[pc_patching] Warning: no ILM PCs were extracted for any head.")
         else:
             print(f"[pc_patching] Extracted ILM PCs for {len(head_pcs)} (layer, head) pairs.")
 
+        # 4) Baseline final-layer label-token representations + probe
         disable_patching()
-        X_final: List[np.ndarray] = []
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            enc = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            out = model(**enc, output_hidden_states=True)
-            last_hidden = out.hidden_states[-1]
-            pooled = _pool_last_hidden(last_hidden, enc["attention_mask"])
-            X_final.append(pooled.detach().float().cpu().numpy())
-
-        X_final_np = np.vstack(X_final)
+        label_hiddens_per_layer, _, match_stats = get_label_token_hidden_per_layer(
+            llm_id,
+            prompts,
+            label_token_strs,
+            device=device,
+            max_length=prompt_max_length,
+            batch_size=batch_size,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            return_label_embs=True,
+        )
+        X_final_np = label_hiddens_per_layer[-1]
+        # Train/val split for more sensitive patching evaluation
         train_idx, val_idx = _train_val_split(y, seed=seed, train_ratio=0.8)
         if len(val_idx) == 0 or len(train_idx) == 0:
+            # Fallback: use all data as both train and val (less ideal)
             train_idx = np.arange(len(y))
             val_idx = np.arange(len(y))
 
@@ -170,6 +191,7 @@ def run_qwen2_head_pc_patching(
         clf.fit(X_final_np[train_idx], y[train_idx])
         base_acc = float(accuracy_score(y[val_idx], clf.predict(X_final_np[val_idx])))
 
+        # 5) Per-head patching evaluation
         head_importance = np.zeros((num_layers, num_heads), dtype=np.float32)
 
         for layer_idx in range(num_layers):
@@ -177,28 +199,28 @@ def run_qwen2_head_pc_patching(
                 pcs = head_pcs.get((layer_idx, h))
                 if pcs is None:
                     continue
-                enable_patching(layer_idx, h, pcs, device=model.device, lambda_scale=1.0)
-                patched_logits: List[np.ndarray] = []
-                for i in range(0, len(texts), batch_size):
-                    batch_texts = texts[i : i + batch_size]
-                    enc = tokenizer(
-                        batch_texts,
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                        return_tensors="pt",
-                    )
-                    enc = {k: v.to(device) for k, v in enc.items()}
-                    out = model(**enc, output_hidden_states=True)
-                    last_hidden = out.hidden_states[-1]
-                    patched_logits.append(_pool_last_hidden(last_hidden, enc["attention_mask"]).detach().float().cpu().numpy())
+                # Use a larger lambda to make the effect more pronounced
+                enable_patching(layer_idx, h, pcs, device=torch.device(device), lambda_scale=3.0)
+
+                patched_label_hiddens, _, _ = get_label_token_hidden_per_layer(
+                    llm_id,
+                    prompts,
+                    label_token_strs,
+                    device=device,
+                    max_length=prompt_max_length,
+                    batch_size=batch_size,
+                    dtype=torch.float16 if device == "cuda" else torch.float32,
+                    return_label_embs=True,
+                )
+                X_patched_np = patched_label_hiddens[-1]
+                # Evaluate patch effect only on validation subset
+                preds = clf.predict(X_patched_np[val_idx])
+                acc_patched = float(accuracy_score(y[val_idx], preds))
+                head_importance[layer_idx, h] = max(0.0, base_acc - acc_patched)
+
                 disable_patching()
-                patched_np = np.vstack(patched_logits)
-                acc = float(accuracy_score(y[val_idx], clf.predict(patched_np[val_idx])))
-                head_importance[layer_idx, h] = max(0.0, base_acc - acc)
 
-        return {
-            "head_importance": head_importance,
-            "base_acc": base_acc,
-        }
-
+    return {
+        "head_importance": head_importance,
+        "base_acc": float(base_acc),
+    }
