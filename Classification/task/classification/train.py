@@ -18,6 +18,10 @@ from model.classification.dataset import CustomDataset
 from model.optimizer.optimizer import get_optimizer
 from model.optimizer.scheduler import get_scheduler
 from utils.utils import TqdmLoggingHandler, write_log, get_tb_exp_name, get_wandb_exp_name, get_torch_device, check_path
+try:
+    from selection import auto_select_layer
+except Exception:
+    auto_select_layer = None
 
 def training(args: argparse.Namespace) -> None:
     device = get_torch_device(args.device)
@@ -47,6 +51,18 @@ def training(args: argparse.Namespace) -> None:
     write_log(logger, "Loaded data successfully")
     write_log(logger, f"Train dataset size / iterations: {len(dataset_dict['train'])} / {len(dataloader_dict['train'])}")
     write_log(logger, f"Valid dataset size / iterations: {len(dataset_dict['valid'])} / {len(dataloader_dict['valid'])}")
+
+    # Optional: auto-select LLM layer before building model
+    if getattr(args, 'auto_select_layer', False) and args.method == 'pifi' and getattr(args, 'layer_num', -1) < 0:
+        if auto_select_layer is None:
+            print("[selection] Module not available; skipping auto selection")
+        else:
+            try:
+                sel_idx = auto_select_layer(args)
+                args.layer_num = int(sel_idx)
+                print(f"[selection] Using auto-selected LLM layer: {args.layer_num}")
+            except Exception as e:
+                print(f"[selection] Failed to auto-select layer: {e}")
 
     write_log(logger, "Building model")
     model = ClassificationModel(args).to(device)
