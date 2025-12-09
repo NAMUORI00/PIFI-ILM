@@ -1,401 +1,671 @@
-"""ILM-style direct layer selection for LLM→SLM transfer.
+"""Qwen2-focused layer selection following the 3-step PCL → PC patching plan."""
+from __future__ import annotations
 
-Supports two scoring methods:
-1. ILM-PCA: PC-label correlation (Sun et al., ACL 2025)
-2. MDL: Minimum Description Length (Voita & Titov, EMNLP 2020)
-"""
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from collections import Counter
+import json
 import os
-from typing import Dict, List, Optional
+import re
 
 import numpy as np
 import torch
-from transformers import AutoConfig
+from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers.generation import GenerationConfig
 
-from core.wandb_manager import PiFiLogger
+from core.utils import get_huggingface_model_name
+from selection.data import resolve_dataset
+from selection.label_embeddings import get_label_token_hidden_per_layer
+from selection.prompts import build_label_prompts
+from selection.qwen2_pc_patching import Qwen2HeadPatchContext, disable_patching, enable_patching
+from selection.scoring import label_correlation
 
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    plt = None
+# Lightweight stopword list to avoid pulling external deps
+STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "in",
+    "on",
+    "to",
+    "and",
+    "or",
+    "of",
+    "for",
+    "with",
+    "at",
+    "is",
+    "are",
+    "was",
+    "were",
+    "it",
+    "this",
+    "that",
+    "be",
+    "as",
+    "by",
+    "from",
+    "not",
+    "but",
+    "we",
+    "you",
+    "they",
+    "their",
+    "our",
+    "your",
+}
+
+
+@dataclass
+class AbstractLayerResult:
+    layer: int
+    scores: List[float]
+    anchor_pc: Optional[np.ndarray]
+    keywords: List[str]
+    match_stats: Dict[str, int]
+    hidden_per_layer: List[np.ndarray]
+    prompts: List[str]
+    label_token_strs: List[List[str]]
+    labels: np.ndarray
+    tokenizer: AutoTokenizer
+    model: AutoModel
+    per_layer_signals: List[Dict[str, float]]
+
+
+@dataclass
+class ApplyLayerResult:
+    layer: int
+    head_effects: np.ndarray
+    base_acc: float
+
+
+def _train_val_split(y: np.ndarray, seed: int = 0, train_ratio: float = 0.8) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    y = np.asarray(y)
+    classes = np.unique(y)
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+    for c in classes:
+        idx = np.where(y == c)[0]
+        if len(idx) == 0:
+            continue
+        rng.shuffle(idx)
+        cut = max(1, int(train_ratio * len(idx)))
+        train_idx.extend(idx[:cut].tolist())
+        val_idx.extend(idx[cut:].tolist())
+    if len(train_idx) == 0 or len(val_idx) == 0:
+        idx = np.arange(len(y))
+        rng.shuffle(idx)
+        cut = max(1, int(train_ratio * len(idx)))
+        train_idx, val_idx = idx[:cut], idx[cut:]
+    return np.array(train_idx, dtype=np.int64), np.array(val_idx, dtype=np.int64)
+
+
+def _default_max_length(dataset: str, provided: int, max_seq_len: int) -> int:
+    if provided > 0:
+        return provided
+    if max_seq_len > 0:
+        return max_seq_len
+    name = (dataset or "").lower()
+    if name in {"imdb"}:
+        return 256
+    if name in {"mnli", "snli"}:
+        return 192
+    if name in {"tweet_offensive", "tweet_sentiment_binary"}:
+        return 128
+    return 128
+
+
+def _normalize_keywords(cands: Sequence[str], top_k: int) -> List[str]:
+    uniq = []
+    for w in cands:
+        w = w.strip().lower()
+        if not w or w in STOPWORDS:
+            continue
+        if not re.match(r"^[a-z][a-z0-9_-]{2,}$", w):
+            continue
+        if w not in uniq:
+            uniq.append(w)
+        if len(uniq) >= top_k:
+            break
+    return uniq
+
+
+def _extract_keywords_tfidf(texts: Sequence[str], top_k: int, seed: int) -> List[str]:
+    try:
+        vec = TfidfVectorizer(
+            max_features=4096,
+            ngram_range=(1, 2),
+            stop_words="english",
+            lowercase=True,
+        )
+        X = vec.fit_transform(texts)
+        scores = np.asarray(X.sum(axis=0)).ravel()
+        idxs = np.argsort(-scores)[: top_k * 3]
+        vocab = np.array(vec.get_feature_names_out())[idxs]
+        return _normalize_keywords(vocab.tolist(), top_k)
+    except Exception:
+        # Fallback to frequency if TF-IDF fails
+        counter: Counter[str] = Counter()
+        rng = np.random.default_rng(seed)
+        for t in texts:
+            tokens = re.findall(r"[A-Za-z]{3,}", t.lower())
+            tokens = [tok for tok in tokens if tok not in STOPWORDS]
+            rng.shuffle(tokens)
+            counter.update(tokens)
+        if not counter:
+            return []
+        return _normalize_keywords([w for w, _ in counter.most_common(top_k * 3)], top_k)
+
+
+def _extract_keywords_llm(
+    texts: Sequence[str],
+    llm_id: str,
+    tokenizer: AutoTokenizer,
+    device: str,
+    top_k: int,
+    sample_limit: int,
+) -> Optional[List[str]]:
+    """Ask the LLM itself to propose task keywords; best-effort with safe fallbacks."""
+    try:
+        subtexts = list(texts)[: max(1, sample_limit)]
+        prompt_lines = ["Extract the top task keywords (comma-separated, single words) for these examples:"]
+        for idx, t in enumerate(subtexts[:6]):
+            prompt_lines.append(f"{idx+1}. {t[:200]}")
+        prompt_lines.append("Keywords:")
+        prompt = "\n".join(prompt_lines)
+        gen_model = AutoModelForCausalLM.from_pretrained(llm_id)
+        gen_model = gen_model.to(device)
+        gen_model.eval()
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        gen_cfg = GenerationConfig(
+            max_new_tokens=64,
+            do_sample=False,
+            temperature=0.7,
+            num_beams=1,
+            pad_token_id=pad_id,
+        )
+        with torch.no_grad():
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
+            outputs = gen_model.generate(**inputs, generation_config=gen_cfg)
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Take trailing segment after "Keywords:" if present
+        if "Keywords:" in decoded:
+            decoded = decoded.split("Keywords:", 1)[1]
+        parts = re.split(r"[,\n]", decoded)
+        kws = _normalize_keywords(parts, top_k)
+        return kws if kws else None
+    except Exception:
+        return None
+
+
+def _extract_task_keywords(
+    texts: Sequence[str],
+    tokenizer: AutoTokenizer,
+    llm_id: str,
+    source: str,
+    top_k: int,
+    seed: int,
+    sample_limit: int,
+    device: str,
+) -> List[str]:
+    source = (source or "tfidf").lower()
+    sample_texts = list(texts)
+    eff_limit = sample_limit if sample_limit > 0 else len(sample_texts)
+    if len(sample_texts) > eff_limit > 0:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(sample_texts), size=eff_limit, replace=False)
+        sample_texts = [sample_texts[int(i)] for i in idx]
+    if source == "llm":
+        kw = _extract_keywords_llm(sample_texts, llm_id, tokenizer, device, top_k=top_k, sample_limit=eff_limit)
+        if kw:
+            return kw
+        # fall back to tfidf if LLM fails
+    return _extract_keywords_tfidf(sample_texts, top_k=top_k, seed=seed)
+
+
+def _keyword_embeddings(keywords: List[str], tokenizer: AutoTokenizer, model: AutoModel) -> np.ndarray:
+    if not keywords:
+        return np.empty((0, model.config.hidden_size), dtype=np.float32)
+    weight = model.get_input_embeddings().weight
+    embs: List[np.ndarray] = []
+    for kw in keywords:
+        ids = tokenizer(kw, add_special_tokens=False)["input_ids"]
+        if not ids:
+            continue
+        vec = weight[ids, :].mean(dim=0)
+        embs.append(vec.detach().float().cpu().numpy())
+    if not embs:
+        return np.empty((0, model.config.hidden_size), dtype=np.float32)
+    return np.stack(embs, axis=0)
+
+
+def _pcl_keyword_score(
+    X: np.ndarray,
+    y: np.ndarray,
+    keyword_embs: np.ndarray,
+    n_pcs: int,
+    top_pc: int,
+    keyword_weight: float,
+) -> Tuple[float, Optional[np.ndarray], Dict[str, float]]:
+    """Compute PCL-inspired score + return the keyword-aligned PC."""
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y)
+    if X.ndim != 2 or X.shape[0] < 8 or X.shape[1] == 0:
+        return 0.0, None, {"keyword_signal": 0.0, "corr_signal": 0.0}
+
+    pcs = min(n_pcs, X.shape[0], X.shape[1])
+    if pcs <= 0:
+        return 0.0, None, {"keyword_signal": 0.0, "corr_signal": 0.0}
+
+    try:
+        pca = PCA(n_components=pcs, random_state=0)
+        S = pca.fit_transform(X)
+    except Exception:
+        return 0.0, None, {"keyword_signal": 0.0, "corr_signal": 0.0}
+
+    comps = pca.components_  # (pcs, hidden_dim)
+    corrs = label_correlation(S, y)
+    corr_signal = 0.0
+    if corrs.size > 0:
+        k = min(top_pc, corrs.size)
+        corr_signal = float(np.mean(np.sort(corrs)[-k:]))
+
+    keyword_signal = 0.0
+    best_pc = None
+    if keyword_embs.size > 0:
+        comp_norm = comps / np.maximum(np.linalg.norm(comps, axis=1, keepdims=True), 1e-8)
+        kw_norm = keyword_embs / np.maximum(np.linalg.norm(keyword_embs, axis=1, keepdims=True), 1e-8)
+        sim = comp_norm @ kw_norm.T  # (pcs, num_keywords)
+        keyword_signal = float(np.max(sim)) if sim.size > 0 else 0.0
+        if sim.size > 0:
+            best_idx = int(np.unravel_index(np.argmax(sim), sim.shape)[0])
+            best_pc = comps[best_idx]
+    if best_pc is None and comps.shape[0] > 0:
+        best_pc = comps[0]
+
+    score = keyword_weight * keyword_signal + (1.0 - keyword_weight) * corr_signal
+    return float(score), best_pc.astype(np.float32) if best_pc is not None else None, {
+        "keyword_signal": keyword_signal,
+        "corr_signal": corr_signal,
+    }
+
+
+def _reshape_anchor_for_heads(anchor_pc: Optional[np.ndarray], model: AutoModel) -> Optional[np.ndarray]:
+    if anchor_pc is None:
+        return None
+    if not hasattr(model, "layers") or len(model.layers) == 0:
+        return None
+    attn = model.layers[0].self_attn
+    num_heads = int(attn.num_heads)
+    head_dim = int(attn.head_dim)
+    target = num_heads * head_dim
+    vec = np.asarray(anchor_pc, dtype=np.float32).flatten()
+    if vec.size < target:
+        reps = int(np.ceil(target / max(1, vec.size)))
+        vec = np.tile(vec, reps)
+    vec = vec[:target]
+    return vec.reshape(num_heads, head_dim)
+
+
+def _prepare_model(llm_id: str, device: str, dtype: torch.dtype) -> Tuple[AutoTokenizer, AutoModel, str]:
+    tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
+    model = AutoModel.from_pretrained(llm_id)
+    if device == "cuda" and torch.cuda.is_available():
+        model = model.to(device=device, dtype=dtype)
+    else:
+        device = "cpu"
+        model = model.to(device=device, dtype=torch.float32)
+    model.eval()
+    return tokenizer, model, device
+
+
+def identify_abstract_layer(
+    llm_id: str,
+    texts: List[str],
+    labels: List[int],
+    n_pcs: int,
+    top_pc: int,
+    k_shot: int,
+    max_length: int,
+    device: str,
+    dtype: torch.dtype,
+    keyword_top_k: int,
+    keyword_source: str,
+    keyword_llm_id: Optional[str],
+    keyword_sample_limit: int,
+    keyword_weight: float,
+    seed: int,
+) -> AbstractLayerResult:
+    prompts, label_token_strs, prompt_labels = build_label_prompts(texts, labels, k_shot=k_shot)
+    tokenizer, model, device = _prepare_model(llm_id, device, dtype)
+
+    hidden_per_layer, _, match_stats = get_label_token_hidden_per_layer(
+        llm_id,
+        prompts,
+        label_token_strs,
+        device=device,
+        max_length=max_length,
+        batch_size=8,
+        dtype=dtype,
+        return_label_embs=False,
+        tokenizer=tokenizer,
+        model=model,
+    )
+    kw_llm_id = keyword_llm_id or llm_id
+    kw_tokenizer = tokenizer if kw_llm_id == llm_id else AutoTokenizer.from_pretrained(kw_llm_id, use_fast=True)
+    keywords = _extract_task_keywords(
+        texts,
+        tokenizer=kw_tokenizer,
+        llm_id=kw_llm_id,
+        source=keyword_source,
+        top_k=keyword_top_k,
+        seed=seed,
+        sample_limit=keyword_sample_limit,
+        device=device,
+    )
+    keyword_embs = _keyword_embeddings(keywords, tokenizer, model)
+    y = np.asarray(prompt_labels, dtype=int)
+
+    scores: List[float] = []
+    pcs: List[Optional[np.ndarray]] = []
+    per_layer_signals: List[Dict[str, float]] = []
+    for layer_idx, X in enumerate(hidden_per_layer):
+        s, pc, sig = _pcl_keyword_score(
+            X,
+            y,
+            keyword_embs,
+            n_pcs=n_pcs,
+            top_pc=top_pc,
+            keyword_weight=keyword_weight,
+        )
+        scores.append(s)
+        pcs.append(pc)
+        per_layer_signals.append(sig)
+
+    if not scores:
+        best_layer = -1
+        anchor_pc = None
+    else:
+        best_layer = int(np.argmax(scores))
+        anchor_pc = pcs[best_layer] if 0 <= best_layer < len(pcs) else None
+        if np.max(scores) <= 0:
+            best_layer = max(0, len(hidden_per_layer) // 2)
+            anchor_pc = pcs[best_layer] if 0 <= best_layer < len(pcs) else anchor_pc
+
+    return AbstractLayerResult(
+        layer=best_layer,
+        scores=scores,
+        anchor_pc=anchor_pc,
+        keywords=keywords,
+        match_stats=match_stats,
+        hidden_per_layer=hidden_per_layer,
+        prompts=prompts,
+        label_token_strs=label_token_strs,
+        labels=y,
+        tokenizer=tokenizer,
+        model=model,
+        per_layer_signals=per_layer_signals,
+    )
+
+
+def identify_apply_layer(
+    llm_id: str,
+    abstract: AbstractLayerResult,
+    lambda_scale: float,
+    max_length: int,
+    batch_size: int,
+    seed: int,
+    val_limit: Optional[int] = None,
+    max_layers: int = 0,
+    max_heads: int = 0,
+) -> ApplyLayerResult:
+    model = abstract.model
+    tokenizer = abstract.tokenizer
+    torch_device = next(model.parameters()).device
+    device_str = "cuda" if torch_device.type == "cuda" else "cpu"
+    dtype = next(model.parameters()).dtype
+
+    # Base probe on final-layer label representations
+    X_final = abstract.hidden_per_layer[-1]
+    y = abstract.labels
+    if X_final.shape[0] < 10:
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+
+    train_idx, val_idx = _train_val_split(y, seed=seed, train_ratio=0.8)
+    if val_limit and len(val_idx) > val_limit:
+        rng = np.random.default_rng(seed)
+        chosen = rng.choice(len(val_idx), size=val_limit, replace=False)
+        val_idx = val_idx[chosen]
+    if len(val_idx) == 0:
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+    clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto", random_state=seed)
+    try:
+        clf.fit(X_final[train_idx], y[train_idx])
+        # Store base probabilities on the validation subset for KL/Δlogit scoring
+        base_proba = clf.predict_proba(X_final[val_idx])  # (N_val, K)
+        base_acc = float(accuracy_score(y[val_idx], clf.predict(X_final[val_idx])))
+    except Exception:
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+
+    # Limit patching to the validation subset to keep runtime reasonable
+    val_prompts = [abstract.prompts[i] for i in val_idx]
+    val_label_token_strs = [abstract.label_token_strs[i] for i in val_idx]
+
+    num_layers = len(model.layers) if hasattr(model, "layers") else 0
+    num_heads = int(model.layers[0].self_attn.num_heads) if num_layers > 0 else 0
+    if max_layers > 0:
+        num_layers = min(num_layers, max_layers)
+    if max_heads > 0:
+        num_heads = min(num_heads, max_heads)
+    head_vectors = _reshape_anchor_for_heads(abstract.anchor_pc, model)
+    if head_vectors is None or num_layers == 0 or num_heads == 0:
+        return ApplyLayerResult(
+            layer=-1,
+            head_effects=np.zeros((num_layers, num_heads), dtype=np.float32),
+            base_acc=base_acc,
+        )
+
+    head_effects = np.zeros((num_layers, num_heads), dtype=np.float32)
+    with Qwen2HeadPatchContext():
+        for layer_idx in range(num_layers):
+            for head_idx in range(num_heads):
+                pcs = head_vectors[head_idx : head_idx + 1]
+                enable_patching(
+                    layer_idx,
+                    head_idx,
+                    pcs,
+                    device=torch_device,
+                    lambda_scale=lambda_scale,
+                )
+                try:
+                    patched_layers, _, _ = get_label_token_hidden_per_layer(
+                        llm_id,
+                        val_prompts,
+                        val_label_token_strs,
+                        device=device_str,
+                        max_length=max_length,
+                        batch_size=batch_size,
+                        dtype=dtype,
+                        return_label_embs=False,
+                        tokenizer=tokenizer,
+                        model=model,
+                    )
+                    X_val_patched = patched_layers[-1]
+                    proba_patched = clf.predict_proba(X_val_patched)
+                    # Clamp to avoid log(0) in KL
+                    eps = 1e-8
+                    p = base_proba
+                    q = proba_patched
+                    p = p.clip(eps, 1.0)
+                    q = q.clip(eps, 1.0)
+                    p /= p.sum(axis=1, keepdims=True)
+                    q /= q.sum(axis=1, keepdims=True)
+                    # D_KL(p || q) averaged over validation set
+                    kl = float((p * (np.log(p) - np.log(q))).sum(axis=1).mean())
+                    effect = max(0.0, kl)
+                except Exception:
+                    effect = 0.0
+                head_effects[layer_idx, head_idx] = effect
+                disable_patching()
+
+    apply_layer = int(np.argmax(head_effects.sum(axis=1))) if head_effects.size > 0 else -1
+    return ApplyLayerResult(layer=apply_layer, head_effects=head_effects, base_acc=base_acc)
 
 
 def auto_select_layer(args) -> int:
-    """Direct ILM-style selection on LLM layers.
-
-    Returns best_llm_layer index (0-based). Saves selection.json with effects.
-    """
+    """Run the 3-step PCL + patching pipeline and return the chosen LLM layer index."""
     task = getattr(args, "task", "classification")
     dataset = getattr(args, "task_dataset", "sst2")
-    slm_type = getattr(args, "model_type", "bert")
-    llm_type = getattr(args, "llm_model", None) or getattr(args, "llm", None) or "llama3.1"
-    n_samples = int(getattr(args, "selection_samples", 400))
-    n_pcs = int(getattr(args, "selection_pcs", 16))
-    top_pc = int(getattr(args, "selection_top_pc", 5))
-    seed = int(getattr(args, "seed", 2023))
-    stride = int(getattr(args, "selection_layer_stride", 1))
-    split = getattr(args, "selection_split", "validation")
-    pooling = getattr(args, "selection_pooling", "mean")
-    sel_max_len = int(
-        getattr(args, "selection_max_length", 0)
-        or getattr(args, "max_seq_len", 0)
-        or 0
-    )
-    dtype_pref = getattr(args, "selection_dtype", "fp32")
-    stratified = str(getattr(args, "selection_stratified", True)).lower() == "true"
-    score_mode = getattr(args, "selection_score_mode", "ilm_pca")
-    silhouette_weight = float(getattr(args, "selection_silhouette_weight", 0.0))
-    depth_bias = float(getattr(args, "selection_depth_bias", 0.0))
-    fisher_weight = float(getattr(args, "selection_fisher_weight", 0.0))
-    entropy_weight = float(getattr(args, "selection_entropy_weight", 0.0))
-    head_alpha = float(getattr(args, "selection_head_alpha", 0.0))
-    match_retry_threshold = float(getattr(args, "selection_match_retry_threshold", 0.2))
-    match_fallback = str(getattr(args, "selection_match_fallback", "none"))
-    # Task-aware default max_length if not provided
-    if sel_max_len == 0:
-        ds = (dataset or "").lower()
-        if ds in {"imdb"}:
-            sel_max_len = 256
-        elif ds in {"mnli", "snli"}:
-            sel_max_len = 192
-        elif ds in {"tweet_offensive", "tweet_sentiment_binary"}:
-            sel_max_len = 128
-        else:
-            sel_max_len = 128
-        print(f"[selection] selection_max_length not set; using task-aware default {sel_max_len} for {ds}")
-
-    # Resolve huggingface model id for LLM
-    from core.utils import get_huggingface_model_name
-
+    llm_type = getattr(args, "llm_model", None) or getattr(args, "llm", None) or "qwen2"
     llm_id = get_huggingface_model_name(llm_type)
 
-    # Head-level PC patching mode (Qwen2-specific)
-    if score_mode == "ilm_head_patching":
-        from selection.pc_patching_heads import run_qwen2_head_pc_patching
-
-        sel_device = getattr(args, "device", None) or (
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-        k_shot = int(getattr(args, "selection_k_shot", 1))
-        print(
-            f"[selection] Running head-level PC patching for {llm_type} "
-            f"on {task}/{dataset} (samples={n_samples}, k_shot={k_shot})"
-        )
-        result = run_qwen2_head_pc_patching(
-            llm_id=llm_id,
-            task=task,
-            dataset=dataset,
-            n_samples=n_samples,
-            split=split,
-            max_length=sel_max_len,
-            device=sel_device,
-            batch_size=16,
-            n_pcs=n_pcs,
-            top_pc=top_pc,
-            seed=seed,
-            k_shot=k_shot,
-            prompt_max_length=sel_max_len,
-        )
-        head_importance = result["head_importance"]  # (layers, heads)
-        layer_scores = head_importance.sum(axis=1) if head_importance.size > 0 else np.zeros(
-            (head_importance.shape[0],), dtype=np.float32
-        )
-
-        effects = layer_scores.tolist()
-        if depth_bias != 0 and len(effects) > 1:
-            num_layers = len(effects)
-            effects = [
-                eff - depth_bias * (idx / (num_layers - 1))
-                for idx, eff in enumerate(effects)
-            ]
-        if not effects:
-            print("[selection] Head patching produced empty scores; defaulting to mid layer")
-            cfg = AutoConfig.from_pretrained(llm_id)
-            return max(0, cfg.num_hidden_layers // 2)
-
-        # Blend with optional base layer scores if provided via args (not available here),
-        # so we just apply alpha on head_importance-derived effects.
-        if head_alpha > 0 and head_importance.size > 0:
-            # Normalize head_importance per layer
-            head_layer = head_importance.sum(axis=1)
-            h_norm = head_layer / (np.max(head_layer) + 1e-8)
-            effects = [
-                (1 - head_alpha) * eff + head_alpha * h_norm[i]
-                for i, eff in enumerate(effects)
-            ]
-
-        best_llm_layer = int(np.argmax(effects))
-
-        metadata = {
-            "task": task,
-            "dataset": dataset,
-            "slm_type": slm_type,
-            "llm_type": llm_type,
-            "n_samples": n_samples,
-            "n_pcs": n_pcs,
-            "top_pc": top_pc,
-            "seed": seed,
-            "score_mode": score_mode,
-            "base_probe_acc": float(result.get("base_acc", 0.0)),
-            "head_alpha": head_alpha if head_alpha != 0 else None,
-        }
-
-        figures = None
-        try:
-            logger = PiFiLogger.from_args(args)
-            out_path = logger.log_selection(effects, best_llm_layer, metadata, figures)
-            print(f"[selection] Saved selection to {out_path}")
-        except Exception as e:
-            print(f"[selection] Logging failed (non-fatal): {e}")
-
-        print(f"[selection] Best LLM layer: {best_llm_layer} (mode={score_mode})")
-        return best_llm_layer
-
-    # Collect data
-    from selection.data import resolve_dataset
-
-    texts, labels = resolve_dataset(
-        task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=stratified
+    n_samples = int(getattr(args, "selection_samples", 200))
+    n_pcs = int(getattr(args, "selection_pcs", 16))
+    top_pc = int(getattr(args, "selection_top_pc", 5))
+    k_shot = int(getattr(args, "selection_k_shot", 1))
+    max_length = _default_max_length(
+        dataset,
+        int(getattr(args, "selection_max_length", 0)),
+        int(getattr(args, "max_seq_len", 0)),
     )
-    if len(texts) < 10:
-        print("[selection] Not enough samples; defaulting to mid layer")
+    keyword_top_k = int(getattr(args, "selection_keyword_top_k", 12))
+    keyword_source = getattr(args, "selection_keyword_source", "tfidf")
+    keyword_llm_id = getattr(args, "selection_keyword_llm_id", None)
+    keyword_sample_limit = int(getattr(args, "selection_keyword_samples", 64))
+    keyword_weight = float(getattr(args, "selection_keyword_weight", 0.65))
+    lambda_scale = float(getattr(args, "selection_lambda_scale", 3.0))
+    patch_val_limit = int(getattr(args, "selection_patch_eval_samples", 0))
+    patch_batch_size = int(getattr(args, "selection_patch_batch_size", 8))
+    multi_layer_span = int(getattr(args, "selection_multi_layer_span", 0))
+    seed = int(getattr(args, "seed", 2023))
+    sel_device = getattr(args, "device", "cuda")
+    dtype_pref = getattr(args, "selection_dtype", "fp16")
+    dtype = torch.float16 if sel_device == "cuda" and torch.cuda.is_available() and dtype_pref == "fp16" else torch.float32
+
+    print(
+        f"[selection] Starting PCL keyword scan for {llm_type} on {task}/{dataset} "
+        f"(samples={n_samples}, k_shot={k_shot}, max_len={max_length})"
+    )
+
+    texts, labels = resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split="validation", stratified=True)
+    if len(texts) < 8:
         cfg = AutoConfig.from_pretrained(llm_id)
-        return max(0, cfg.num_hidden_layers // 2)
+        fallback = max(0, cfg.num_hidden_layers // 2)
+        print("[selection] Not enough samples for selection; using middle layer", fallback)
+        return fallback
 
-    # Collect pooled hidden per layer for LLM
-    from selection.embeddings import get_llm_hidden_layers
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if (dtype_pref == "fp16" and device == "cuda") else torch.float32
-    use_label_tokens = score_mode == "ilm_pca_unembed"
-    label_embs = None
-
-    if use_label_tokens:
-        from selection.prompts import build_label_prompts
-        from selection.label_embeddings import get_label_token_hidden_per_layer
-
-        k_shot = int(getattr(args, "selection_k_shot", 1))
-        prompts, label_token_strs, prompt_labels = build_label_prompts(texts, labels, k_shot=k_shot)
-        hidden_per_layer, label_embs, match_stats = get_label_token_hidden_per_layer(
-            llm_id,
-            prompts,
-            label_token_strs,
-            device=device,
-            max_length=sel_max_len,
-            batch_size=8,
-            dtype=dtype,
-            return_label_embs=True,
-            fallback=match_fallback,
-        )
-        if len(label_token_strs) != len(prompts):
-            print(f"[selection] Warning: label token alignment mismatch ({len(label_token_strs)} vs {len(prompts)})")
-
-        # Retry with longer max_length if match fail rate is high
-        total_match = max(1, match_stats["match_success"] + match_stats["match_fail"])
-        fail_rate = match_stats["match_fail"] / total_match
-        if fail_rate > match_retry_threshold:
-            retry_len = int(sel_max_len * 1.5)
-            print(
-                f"[selection] High match fail rate ({fail_rate:.2f}); retrying with max_length={retry_len}"
-            )
-            hidden_per_layer, label_embs, match_stats = get_label_token_hidden_per_layer(
-                llm_id,
-                prompts,
-                label_token_strs,
-                device=device,
-                max_length=retry_len,
-                batch_size=8,
-                dtype=dtype,
-                return_label_embs=True,
-                fallback=match_fallback,
-            )
-            sel_max_len = retry_len
-        y_arr = np.array(prompt_labels, dtype=int)
-    else:
-        hidden_per_layer, _, match_stats = get_llm_hidden_layers(
-            llm_id,
-            texts,
-            device=device,
-            max_length=sel_max_len,
-            batch_size=16,
-            dtype=dtype,
-            pooling=pooling,
-            l2_norm=True,
-        )
-        y_arr = np.array(labels)
-
-    num_layers = len(hidden_per_layer)
-    print(f"[selection] Scoring {num_layers} layers with mode={score_mode}")
-
-    # Score each layer
-    from selection.scoring import compute_score_for_layer
-
-    effects: List[float] = []
-    for Li, X in enumerate(hidden_per_layer):
-        if stride > 1 and (Li % stride != 0):
-            effects.append(0.0)
-            continue
-        try:
-            eff = compute_score_for_layer(
-                X,
-                y_arr,
-                mode=score_mode,
-                n_pcs=n_pcs,
-                top_pc=top_pc,
-                seed=seed,
-                silhouette_weight=silhouette_weight,
-                fisher_weight=fisher_weight,
-                entropy_weight=entropy_weight,
-                label_embs=label_embs,
-            )
-        except Exception as e:
-            print(f"[selection] LLM layer {Li} scoring failed: {e}; using fallback")
-            eff = 0.0
-        # Depth bias: penalize deeper layers if requested to counter last-layer preference
-        if depth_bias != 0 and num_layers > 1:
-            depth_penalty = depth_bias * (Li / (num_layers - 1))
-            eff -= depth_penalty
-        effects.append(eff)
-
-    # Select best layer (argmax for all modes - MDL is already negated)
-    best_llm_layer = int(np.argmax(effects))
-
-    # Compute layer x PC correlation matrix for visualization (ILM-PCA only)
-    corr_mat = None
-    if score_mode == "ilm_pca":
-        try:
-            from selection.scoring import label_correlation, pca_scores
-
-            corr_rows: List[np.ndarray] = []
-            for X in hidden_per_layer:
-                pcs = min(n_pcs, X.shape[0], X.shape[1])
-                if pcs <= 0:
-                    corr_rows.append(np.zeros((n_pcs,), dtype=np.float32))
-                    continue
-                S, _ = pca_scores(X, n_components=pcs)
-                corrs = label_correlation(S, y)
-                row = np.zeros((n_pcs,), dtype=np.float32)
-                row[:pcs] = corrs[:pcs]
-                corr_rows.append(row)
-            corr_mat = np.stack(corr_rows, axis=0)
-        except Exception:
-            corr_mat = None
-
-    # Prepare metadata
-    metadata = {
-        "task": task,
-        "dataset": dataset,
-        "slm_type": slm_type,
-        "llm_type": llm_type,
-        "n_samples": n_samples,
-        "n_pcs": n_pcs,
-        "top_pc": top_pc,
-        "seed": seed,
-        "score_mode": score_mode,
-        "silhouette_weight": silhouette_weight if score_mode.startswith("ilm_pca") else None,
-        "depth_bias": depth_bias if depth_bias != 0 else None,
-        "use_label_tokens": use_label_tokens,
-        "fisher_weight": fisher_weight if fisher_weight != 0 else None,
-        "entropy_weight": entropy_weight if entropy_weight != 0 else None,
-        "head_alpha": head_alpha if head_alpha != 0 else None,
-        "match_success": match_stats["match_success"],
-        "match_fail": match_stats["match_fail"],
-        "selection_max_length": sel_max_len,
-    }
-
-    # Create figures if logging/saving plots is enabled
-    figures = None
-    should_log_plots = getattr(args, "log_selection", True) or getattr(
-        args, "save_selection_plots", False
-    )
-    if should_log_plots and getattr(args, "log_selection_pca", True):
-        try:
-            figures = _create_selection_figures(
-                effects,
-                best_llm_layer,
-                n_pcs,
-                corr_mat=corr_mat,
-                hidden_per_layer=hidden_per_layer,
-                labels=y,
-                plot_layers_spec=getattr(args, "selection_plot_layers", "best,first,mid,last"),
-                max_layers=getattr(args, "selection_plot_max_layers", 6),
-            )
-        except Exception as e:
-            print(f"[selection] Figure creation failed (non-fatal): {e}")
-            figures = {}
-
-    # Use unified PiFiLogger for logging (W&B + local)
-    try:
-        logger = PiFiLogger.from_args(args)
-        out_path = logger.log_selection(effects, best_llm_layer, metadata, figures)
-        print(f"[selection] Saved selection to {out_path}")
-    except Exception as e:
-        print(f"[selection] Logging failed (non-fatal): {e}")
-
-    # Close figures to free memory
-    if figures and plt is not None:
-        for fig in figures.values():
-            plt.close(fig)
-
-    print(f"[selection] Best LLM layer: {best_llm_layer} (mode={score_mode})")
-    return best_llm_layer
-
-
-def _select_plot_layers(n_layers: int, best: int, spec: str, max_layers: int) -> List[int]:
-    """Resolve which layers to plot based on spec string."""
-    if not spec:
-        spec = "best,first,mid,last"
-    if spec.strip().lower() == "all":
-        idxs = list(range(n_layers))
-    else:
-        idxs = []
-        tokens = [t.strip().lower() for t in spec.split(",") if t.strip()]
-        for t in tokens:
-            if t == "best" and 0 <= best < n_layers:
-                idxs.append(best)
-            elif t == "first":
-                idxs.append(0)
-            elif t == "last":
-                idxs.append(n_layers - 1)
-            elif t == "mid":
-                idxs.append(max(0, n_layers // 2))
-            else:
-                try:
-                    v = int(t)
-                    if 0 <= v < n_layers:
-                        idxs.append(v)
-                except Exception:
-                    pass
-    # unique and cap
-    uniq = []
-    for v in idxs:
-        if v not in uniq:
-            uniq.append(v)
-    return uniq[: max(1, max_layers)]
-
-
-def _create_selection_figures(
-    effects: List[float],
-    best_layer: int,
-    n_pcs: int,
-    corr_mat: Optional[np.ndarray] = None,
-    hidden_per_layer: Optional[List[np.ndarray]] = None,
-    labels: Optional[np.ndarray] = None,
-    plot_layers_spec: str = "best,first,mid,last",
-    max_layers: int = 6,
-) -> Dict[str, "plt.Figure"]:
-    """Create all selection visualization figures."""
-    if plt is None:
-        return {}
-
-    from selection.visualization import create_selection_figures as _viz_create
-
-    return _viz_create(
-        effects,
-        best_layer,
-        n_pcs,
-        corr_mat=corr_mat,
-        hidden_per_layer=hidden_per_layer,
+    abstract = identify_abstract_layer(
+        llm_id=llm_id,
+        texts=texts,
         labels=labels,
-        plot_layers_spec=plot_layers_spec,
-        max_layers=max_layers,
+        n_pcs=n_pcs,
+        top_pc=top_pc,
+        k_shot=k_shot,
+        max_length=max_length,
+        device=sel_device,
+        dtype=dtype,
+        keyword_top_k=keyword_top_k,
+        keyword_source=keyword_source,
+        keyword_llm_id=keyword_llm_id,
+        keyword_sample_limit=keyword_sample_limit,
+        keyword_weight=keyword_weight,
+        seed=seed,
     )
+    if abstract.layer < 0:
+        cfg = AutoConfig.from_pretrained(llm_id)
+        fallback = max(0, cfg.num_hidden_layers // 2)
+        print("[selection] PCL scoring failed; using middle layer", fallback)
+        return fallback
+
+    print(
+        f"[selection][Stage1] L_Abstract={abstract.layer} | "
+        f"keyword_peak={abstract.per_layer_signals[abstract.layer]['keyword_signal']:.3f} "
+        f"corr={abstract.per_layer_signals[abstract.layer]['corr_signal']:.3f} "
+        f"(source={keyword_source}, top_k={keyword_top_k})"
+    )
+    if abstract.keywords:
+        preview = abstract.keywords[: min(8, len(abstract.keywords))]
+        print(f"[selection][Stage1] Keywords used: {preview}")
+
+    apply = identify_apply_layer(
+        llm_id=llm_id,
+        abstract=abstract,
+        lambda_scale=lambda_scale,
+        max_length=max_length,
+        batch_size=patch_batch_size,
+        seed=seed,
+        val_limit=patch_val_limit if patch_val_limit > 0 else None,
+        max_layers=int(getattr(args, "selection_max_layers", 0)),
+        max_heads=int(getattr(args, "selection_max_heads", 0)),
+    )
+
+    if apply.layer < 0 or apply.head_effects.size == 0 or float(np.max(apply.head_effects)) == 0.0:
+        final_layer = abstract.layer
+        print("[selection][Stage2] No strong causal heads detected; falling back to L_Abstract")
+    else:
+        final_layer = apply.layer
+        print(
+            f"[selection][Stage2] L_Apply={apply.layer} | "
+            f"base_acc={apply.base_acc:.3f} | max_head_effect={apply.head_effects.max():.3f}"
+        )
+
+    # Optional JSON logging of selection signals for later analysis
+    log_dir = getattr(args, "selection_log_dir", None)
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(
+                log_dir,
+                f"{task}_{dataset}_{llm_type}_seed{seed}.json",
+            )
+            payload = {
+                "task": task,
+                "dataset": dataset,
+                "llm_type": llm_type,
+                "seed": seed,
+                "n_samples": n_samples,
+                "L_Abstract": int(abstract.layer),
+                "L_Apply": int(apply.layer) if apply.layer is not None else -1,
+                "final_layer": int(final_layer),
+                "keyword_source": keyword_source,
+                "keyword_top_k": keyword_top_k,
+                "keywords": abstract.keywords,
+                "per_layer_signals": [
+                    {
+                        "layer": int(i),
+                        "keyword_signal": float(sig.get("keyword_signal", 0.0)),
+                        "corr_signal": float(sig.get("corr_signal", 0.0)),
+                    }
+                    for i, sig in enumerate(abstract.per_layer_signals)
+                ],
+                "base_acc": float(apply.base_acc) if apply.layer >= 0 else None,
+                "max_head_effect": float(apply.head_effects.max()) if apply.head_effects.size > 0 else None,
+            }
+            with open(log_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            print(f"[selection][Stage3] Logged selection details to {log_path}")
+        except Exception as e:
+            print(f"[selection][Stage3] Failed to log selection details: {e}")
+
+    if multi_layer_span > 0:
+        num_layers_total = len(abstract.hidden_per_layer)
+        candidates = set()
+        for base in [abstract.layer, apply.layer]:
+            if base is None or base < 0:
+                continue
+            for d in range(-multi_layer_span, multi_layer_span + 1):
+                cand = base + d
+                if 0 <= cand < num_layers_total:
+                    candidates.add(int(cand))
+        if candidates:
+            cand_sorted = sorted(candidates)
+            print(f"[selection][Stage3] Multi-layer window suggestion for ablations: {cand_sorted}")
+
+    print(f"[selection][Stage3] Final L_LLM={final_layer} (default to L_Apply else L_Abstract)")
+    return int(final_layer)

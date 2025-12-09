@@ -26,6 +26,8 @@ def get_label_token_hidden_per_layer(
     dtype: Optional[torch.dtype] = None,
     return_label_embs: bool = False,
     fallback: str = "none",
+    tokenizer: Optional[AutoTokenizer] = None,
+    model: Optional[AutoModel] = None,
 ) -> List[np.ndarray] | Tuple[List[np.ndarray], np.ndarray]:
     """
     Encode prompts and collect per-layer hidden states at label-token positions.
@@ -38,19 +40,34 @@ def get_label_token_hidden_per_layer(
         max_length: truncation length
         batch_size: batch size
         dtype: torch dtype (defaults to fp16 on cuda)
+        tokenizer: optional pre-loaded tokenizer (stays untouched)
+        model: optional pre-loaded model (moved to device/dtype if provided)
 
     Returns:
         List[np.ndarray] per layer, stacked over examples (N, hidden_dim)
     """
-    tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
-    model = AutoModel.from_pretrained(llm_id)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
+    own_model = model is None
+    if model is None:
+        model = AutoModel.from_pretrained(llm_id)
     if device == "cuda" and torch.cuda.is_available():
         if dtype is None:
             dtype = torch.float16
-        model = model.to(device=device, dtype=dtype)
+        if own_model:
+            model = model.to(device=device, dtype=dtype)
+        else:
+            model = model.to(device)
+            if dtype is not None and model.dtype != dtype:
+                model = model.to(dtype=dtype)
     else:
         device = "cpu"
-        model = model.to(device)
+        if own_model:
+            model = model.to(device)
+        else:
+            model = model.to(device)
+            if dtype is not None and model.dtype != dtype:
+                model = model.to(dtype=dtype)
     model.eval()
 
     # prime for num_layers and dim
