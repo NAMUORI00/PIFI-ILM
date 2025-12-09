@@ -529,11 +529,7 @@ def identify_apply_layer(
                     # D_KL(p || q) averaged over validation set
                     kl = float((p * (np.log(p) - np.log(q))).sum(axis=1).mean())
                     effect = max(0.0, kl)
-                except Exception as e:
-                    if layer_idx == 0 and head_idx == 0:
-                        import traceback
-                        print(f"[DEBUG] Exception in head patching: {type(e).__name__}: {e}")
-                        traceback.print_exc()
+                except Exception:
                     effect = 0.0
                 head_effects[layer_idx, head_idx] = effect
                 disable_patching()
