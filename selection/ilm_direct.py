@@ -18,7 +18,13 @@ from sklearn.metrics import accuracy_score
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 from transformers.generation import GenerationConfig
 
-from core.utils import get_huggingface_model_name
+try:
+    from core.utils import get_huggingface_model_name
+except Exception:  # fallback when core package is unavailable (e.g., standalone selection)
+    try:
+        from Classification.utils.utils import get_huggingface_model_name  # type: ignore
+    except Exception:
+        from TextualEntailment.utils.utils import get_huggingface_model_name  # type: ignore
 from selection.data import resolve_dataset
 from selection.label_embeddings import get_label_token_hidden_per_layer
 from selection.prompts import build_label_prompts
