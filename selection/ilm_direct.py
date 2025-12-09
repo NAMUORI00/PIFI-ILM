@@ -37,13 +37,31 @@ def auto_select_layer(args) -> int:
     pooling = getattr(args, "selection_pooling", "mean")
     sel_max_len = int(
         getattr(args, "selection_max_length", 0)
-        or getattr(args, "max_seq_len", 128)
-        or 128
+        or getattr(args, "max_seq_len", 0)
+        or 0
     )
     dtype_pref = getattr(args, "selection_dtype", "fp32")
     stratified = str(getattr(args, "selection_stratified", True)).lower() == "true"
     score_mode = getattr(args, "selection_score_mode", "ilm_pca")
-    mdl_n_portions = int(getattr(args, "mdl_n_portions", 10))
+    silhouette_weight = float(getattr(args, "selection_silhouette_weight", 0.0))
+    depth_bias = float(getattr(args, "selection_depth_bias", 0.0))
+    fisher_weight = float(getattr(args, "selection_fisher_weight", 0.0))
+    entropy_weight = float(getattr(args, "selection_entropy_weight", 0.0))
+    head_alpha = float(getattr(args, "selection_head_alpha", 0.0))
+    match_retry_threshold = float(getattr(args, "selection_match_retry_threshold", 0.2))
+    match_fallback = str(getattr(args, "selection_match_fallback", "none"))
+    # Task-aware default max_length if not provided
+    if sel_max_len == 0:
+        ds = (dataset or "").lower()
+        if ds in {"imdb"}:
+            sel_max_len = 256
+        elif ds in {"mnli", "snli"}:
+            sel_max_len = 192
+        elif ds in {"tweet_offensive", "tweet_sentiment_binary"}:
+            sel_max_len = 128
+        else:
+            sel_max_len = 128
+        print(f"[selection] selection_max_length not set; using task-aware default {sel_max_len} for {ds}")
 
     # Resolve huggingface model id for LLM
     from core.utils import get_huggingface_model_name
@@ -57,9 +75,10 @@ def auto_select_layer(args) -> int:
         sel_device = getattr(args, "device", None) or (
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+        k_shot = int(getattr(args, "selection_k_shot", 1))
         print(
             f"[selection] Running head-level PC patching for {llm_type} "
-            f"on {task}/{dataset} (samples={n_samples})"
+            f"on {task}/{dataset} (samples={n_samples}, k_shot={k_shot})"
         )
         result = run_qwen2_head_pc_patching(
             llm_id=llm_id,
@@ -73,6 +92,8 @@ def auto_select_layer(args) -> int:
             n_pcs=n_pcs,
             top_pc=top_pc,
             seed=seed,
+            k_shot=k_shot,
+            prompt_max_length=sel_max_len,
         )
         head_importance = result["head_importance"]  # (layers, heads)
         layer_scores = head_importance.sum(axis=1) if head_importance.size > 0 else np.zeros(
@@ -80,10 +101,27 @@ def auto_select_layer(args) -> int:
         )
 
         effects = layer_scores.tolist()
+        if depth_bias != 0 and len(effects) > 1:
+            num_layers = len(effects)
+            effects = [
+                eff - depth_bias * (idx / (num_layers - 1))
+                for idx, eff in enumerate(effects)
+            ]
         if not effects:
             print("[selection] Head patching produced empty scores; defaulting to mid layer")
             cfg = AutoConfig.from_pretrained(llm_id)
             return max(0, cfg.num_hidden_layers // 2)
+
+        # Blend with optional base layer scores if provided via args (not available here),
+        # so we just apply alpha on head_importance-derived effects.
+        if head_alpha > 0 and head_importance.size > 0:
+            # Normalize head_importance per layer
+            head_layer = head_importance.sum(axis=1)
+            h_norm = head_layer / (np.max(head_layer) + 1e-8)
+            effects = [
+                (1 - head_alpha) * eff + head_alpha * h_norm[i]
+                for i, eff in enumerate(effects)
+            ]
 
         best_llm_layer = int(np.argmax(effects))
 
@@ -98,6 +136,7 @@ def auto_select_layer(args) -> int:
             "seed": seed,
             "score_mode": score_mode,
             "base_probe_acc": float(result.get("base_acc", 0.0)),
+            "head_alpha": head_alpha if head_alpha != 0 else None,
         }
 
         figures = None
@@ -127,17 +166,62 @@ def auto_select_layer(args) -> int:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if (dtype_pref == "fp16" and device == "cuda") else torch.float32
-    hidden_per_layer = get_llm_hidden_layers(
-        llm_id,
-        texts,
-        device=device,
-        max_length=sel_max_len,
-        batch_size=16,
-        dtype=dtype,
-        pooling=pooling,
-        l2_norm=True,
-    )
-    y = np.array(labels)
+    use_label_tokens = score_mode == "ilm_pca_unembed"
+    label_embs = None
+
+    if use_label_tokens:
+        from selection.prompts import build_label_prompts
+        from selection.label_embeddings import get_label_token_hidden_per_layer
+
+        k_shot = int(getattr(args, "selection_k_shot", 1))
+        prompts, label_token_strs, prompt_labels = build_label_prompts(texts, labels, k_shot=k_shot)
+        hidden_per_layer, label_embs, match_stats = get_label_token_hidden_per_layer(
+            llm_id,
+            prompts,
+            label_token_strs,
+            device=device,
+            max_length=sel_max_len,
+            batch_size=8,
+            dtype=dtype,
+            return_label_embs=True,
+            fallback=match_fallback,
+        )
+        if len(label_token_strs) != len(prompts):
+            print(f"[selection] Warning: label token alignment mismatch ({len(label_token_strs)} vs {len(prompts)})")
+
+        # Retry with longer max_length if match fail rate is high
+        total_match = max(1, match_stats["match_success"] + match_stats["match_fail"])
+        fail_rate = match_stats["match_fail"] / total_match
+        if fail_rate > match_retry_threshold:
+            retry_len = int(sel_max_len * 1.5)
+            print(
+                f"[selection] High match fail rate ({fail_rate:.2f}); retrying with max_length={retry_len}"
+            )
+            hidden_per_layer, label_embs, match_stats = get_label_token_hidden_per_layer(
+                llm_id,
+                prompts,
+                label_token_strs,
+                device=device,
+                max_length=retry_len,
+                batch_size=8,
+                dtype=dtype,
+                return_label_embs=True,
+                fallback=match_fallback,
+            )
+            sel_max_len = retry_len
+        y_arr = np.array(prompt_labels, dtype=int)
+    else:
+        hidden_per_layer, _, match_stats = get_llm_hidden_layers(
+            llm_id,
+            texts,
+            device=device,
+            max_length=sel_max_len,
+            batch_size=16,
+            dtype=dtype,
+            pooling=pooling,
+            l2_norm=True,
+        )
+        y_arr = np.array(labels)
 
     num_layers = len(hidden_per_layer)
     print(f"[selection] Scoring {num_layers} layers with mode={score_mode}")
@@ -148,21 +232,28 @@ def auto_select_layer(args) -> int:
     effects: List[float] = []
     for Li, X in enumerate(hidden_per_layer):
         if stride > 1 and (Li % stride != 0):
-            effects.append(float("-inf") if score_mode == "mdl" else 0.0)
+            effects.append(0.0)
             continue
         try:
             eff = compute_score_for_layer(
                 X,
-                y,
+                y_arr,
                 mode=score_mode,
                 n_pcs=n_pcs,
                 top_pc=top_pc,
-                mdl_n_portions=mdl_n_portions,
                 seed=seed,
+                silhouette_weight=silhouette_weight,
+                fisher_weight=fisher_weight,
+                entropy_weight=entropy_weight,
+                label_embs=label_embs,
             )
         except Exception as e:
             print(f"[selection] LLM layer {Li} scoring failed: {e}; using fallback")
-            eff = float("-inf") if score_mode == "mdl" else 0.0
+            eff = 0.0
+        # Depth bias: penalize deeper layers if requested to counter last-layer preference
+        if depth_bias != 0 and num_layers > 1:
+            depth_penalty = depth_bias * (Li / (num_layers - 1))
+            eff -= depth_penalty
         effects.append(eff)
 
     # Select best layer (argmax for all modes - MDL is already negated)
@@ -200,7 +291,15 @@ def auto_select_layer(args) -> int:
         "top_pc": top_pc,
         "seed": seed,
         "score_mode": score_mode,
-        "mdl_n_portions": mdl_n_portions if score_mode == "mdl" else None,
+        "silhouette_weight": silhouette_weight if score_mode.startswith("ilm_pca") else None,
+        "depth_bias": depth_bias if depth_bias != 0 else None,
+        "use_label_tokens": use_label_tokens,
+        "fisher_weight": fisher_weight if fisher_weight != 0 else None,
+        "entropy_weight": entropy_weight if entropy_weight != 0 else None,
+        "head_alpha": head_alpha if head_alpha != 0 else None,
+        "match_success": match_stats["match_success"],
+        "match_fail": match_stats["match_fail"],
+        "selection_max_length": sel_max_len,
     }
 
     # Create figures if logging/saving plots is enabled

@@ -13,6 +13,8 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 
 from selection.data import resolve_dataset
+from selection.prompts import build_label_prompts
+from selection.label_embeddings import get_label_token_hidden_per_layer
 from selection.qwen2_pc_patching import (
     ILMHeadPatchState,
     Qwen2HeadPatchContext,
@@ -70,6 +72,8 @@ def run_qwen2_head_pc_patching(
     n_pcs: int = 4,
     top_pc: int = 2,
     seed: int = 2023,
+    k_shot: int = 1,
+    prompt_max_length: int = 256,
 ) -> Dict[str, np.ndarray]:
     """
     Full ILM-style PC patching pipeline for Qwen2 attention heads.
@@ -88,7 +92,8 @@ def run_qwen2_head_pc_patching(
     """
     # 1) Resolve data
     texts, labels = resolve_dataset(task, dataset, n_samples=n_samples, seed=seed, split=split, stratified=True)
-    y = np.asarray(labels)
+    prompts, label_token_strs, prompt_labels = build_label_prompts(texts, labels, k_shot=k_shot)
+    y = np.asarray(prompt_labels)
 
     # 2) Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
@@ -108,17 +113,16 @@ def run_qwen2_head_pc_patching(
         reset_collection()
         start_collection()
 
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
+        for i in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[i : i + batch_size]
             enc = tokenizer(
-                batch_texts,
+                batch_prompts,
                 padding=True,
                 truncation=True,
-                max_length=max_length,
+                max_length=prompt_max_length,
                 return_tensors="pt",
             )
             enc = {k: v.to(device) for k, v in enc.items()}
-            # We only need hidden_states=False here; patched attention will collect internal head outputs.
             _ = model(**enc)
 
         stop_collection()
@@ -163,25 +167,19 @@ def run_qwen2_head_pc_patching(
         else:
             print(f"[pc_patching] Extracted ILM PCs for {len(head_pcs)} (layer, head) pairs.")
 
-        # 4) Baseline final-layer representations + probe
+        # 4) Baseline final-layer label-token representations + probe
         disable_patching()
-        X_final: List[np.ndarray] = []
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i : i + batch_size]
-            enc = tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            out = model(**enc, output_hidden_states=True)
-            last_hidden = out.hidden_states[-1]  # (B, T, D)
-            pooled = _pool_last_hidden(last_hidden, enc["attention_mask"])  # (B, D)
-            X_final.append(pooled.detach().float().cpu().numpy())
-
-        X_final_np = np.vstack(X_final)
+        label_hiddens_per_layer, _, match_stats = get_label_token_hidden_per_layer(
+            llm_id,
+            prompts,
+            label_token_strs,
+            device=device,
+            max_length=prompt_max_length,
+            batch_size=batch_size,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            return_label_embs=True,
+        )
+        X_final_np = label_hiddens_per_layer[-1]
         # Train/val split for more sensitive patching evaluation
         train_idx, val_idx = _train_val_split(y, seed=seed, train_ratio=0.8)
         if len(val_idx) == 0 or len(train_idx) == 0:
@@ -204,23 +202,17 @@ def run_qwen2_head_pc_patching(
                 # Use a larger lambda to make the effect more pronounced
                 enable_patching(layer_idx, h, pcs, device=torch.device(device), lambda_scale=3.0)
 
-                X_patched: List[np.ndarray] = []
-                for i in range(0, len(texts), batch_size):
-                    batch_texts = texts[i : i + batch_size]
-                    enc = tokenizer(
-                        batch_texts,
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                        return_tensors="pt",
-                    )
-                    enc = {k: v.to(device) for k, v in enc.items()}
-                    out = model(**enc, output_hidden_states=True)
-                    last_hidden = out.hidden_states[-1]
-                    pooled = _pool_last_hidden(last_hidden, enc["attention_mask"])
-                    X_patched.append(pooled.detach().float().cpu().numpy())
-
-                X_patched_np = np.vstack(X_patched)
+                patched_label_hiddens, _, _ = get_label_token_hidden_per_layer(
+                    llm_id,
+                    prompts,
+                    label_token_strs,
+                    device=device,
+                    max_length=prompt_max_length,
+                    batch_size=batch_size,
+                    dtype=torch.float16 if device == "cuda" else torch.float32,
+                    return_label_embs=True,
+                )
+                X_patched_np = patched_label_hiddens[-1]
                 # Evaluate patch effect only on validation subset
                 preds = clf.predict(X_patched_np[val_idx])
                 acc_patched = float(accuracy_score(y[val_idx], preds))

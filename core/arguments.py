@@ -180,15 +180,30 @@ class ArgParser():
         self.parser.add_argument('--selection_stratified', type=parse_bool, default=True,
                                  help='Use stratified sampling for selection set; Default is True')
         self.parser.add_argument('--selection_score_mode', type=str,
-                                 choices=['ilm_pca', 'mdl', 'ilm_head_patching'],
+                                 choices=['ilm_pca', 'ilm_pca_silhouette', 'ilm_pca_unembed', 'ilm_head_patching'],
                                  default='ilm_pca',
                                  help='Scoring mode for ILM selection: '
                                       'ilm_pca (PC-label correlation), '
-                                      'mdl (Minimum Description Length), '
+                                      'ilm_pca_silhouette (PC + silhouette regularizer), '
+                                      'ilm_pca_unembed (label-token PC vs embedding cosine), '
                                       'ilm_head_patching (head-level PC patching for Qwen2); '
                                       'Default is ilm_pca')
-        self.parser.add_argument('--mdl_n_portions', type=int, default=10,
-                                 help='Number of portions for MDL online coding; Default is 10')
+        self.parser.add_argument('--selection_silhouette_weight', type=float, default=0.0,
+                                 help='Weight for silhouette term when using ILM-PCA scoring; Default 0 (disabled)')
+        self.parser.add_argument('--selection_depth_bias', type=float, default=0.0,
+                                 help='Depth penalty coefficient; higher penalizes deeper layers to counter last-layer bias; Default 0')
+        self.parser.add_argument('--selection_k_shot', type=int, default=1,
+                                 help='k-shot size for prompt construction in ILM selection; Default 1')
+        self.parser.add_argument('--selection_fisher_weight', type=float, default=0.0,
+                                 help='Weight for Fisher signal when using ILM-PCA scoring; Default 0')
+        self.parser.add_argument('--selection_entropy_weight', type=float, default=0.0,
+                                 help='Weight for entropy/purity signal when using ILM-PCA scoring; Default 0')
+        self.parser.add_argument('--selection_head_alpha', type=float, default=0.0,
+                                 help='Weight to combine head_importance with layer scores in head patching mode; Default 0 (no blending)')
+        self.parser.add_argument('--selection_match_retry_threshold', type=float, default=0.2,
+                                 help='Retry label-token matching with longer max_length if failure rate exceeds this; Default 0.2')
+        self.parser.add_argument('--selection_match_fallback', type=str, choices=['none','cls','last'], default='none',
+                                 help='Fallback pooling when label-token match fails: none/cls/last; Default none')
 
         # Model - Optimizer & Scheduler arguments
         optim_list = ['SGD', 'AdaDelta', 'Adam', 'AdamW']
