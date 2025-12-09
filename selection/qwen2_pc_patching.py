@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers.models.qwen2.modeling_qwen2 import Qwen2SdpaAttention
 
 
@@ -170,6 +171,8 @@ def patched_qwen2_sdpa_forward(
     """
     Drop-in replacement for Qwen2SdpaAttention.forward with ILM head collection/patching.
     """
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
+
     bsz, q_len, _ = hidden_states.size()
 
     query_states = self.q_proj(hidden_states)
@@ -181,43 +184,53 @@ def patched_qwen2_sdpa_forward(
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
     kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb, repeat_kv
 
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    # Apply rotary position embedding (requires position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    # Handle KV cache
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # (B, H, T, D)
-    attn_output = self._scaled_dot_product_attention(
+    # Prepare attention mask for SDPA
+    causal_mask = attention_mask
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+    # Ensure contiguous tensors for SDPA
+    if query_states.device.type == "cuda" and attention_mask is not None:
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+
+    # Determine is_causal flag
+    is_causal = True if causal_mask is None and q_len > 1 else False
+
+    # (B, H, T, D) - Use PyTorch's F.scaled_dot_product_attention
+    attn_output = F.scaled_dot_product_attention(
         query_states,
         key_states,
         value_states,
-        attention_mask,
-        is_causal=self.is_causal,
-        dropout=self.attention_dropout if self.training else 0.0,
-        is_cross_attention=self.is_cross_attention,
+        attn_mask=causal_mask,
+        dropout_p=self.attention_dropout if self.training else 0.0,
+        is_causal=is_causal,
     )
 
     _collect_head_vectors(self.layer_idx, attn_output)
     attn_output = _apply_pc_patching(self.layer_idx, attn_output)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.view(bsz, q_len, self.hidden_size)
     attn_output = self.o_proj(attn_output)
 
-    if not output_attentions:
-        attn_weights = None
-    else:
-        attn_weights = None  # not collected
-
-    if use_cache:
-        next_cache = ((key_states, value_states),)
-    else:
-        next_cache = None
-
-    return attn_output, attn_weights, next_cache
+    return attn_output, None, past_key_value
 
 
 class Qwen2HeadPatchContext:
