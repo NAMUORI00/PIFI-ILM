@@ -80,6 +80,34 @@ class ArgParser():
         self.parser.add_argument('--layer_num', type=int, default=-1,
                                  help='Layer number of the LLM model; Default is -1')
 
+        # Auto layer selection (ILM)
+        self.parser.add_argument('--auto_select_layer', type=parse_bool, default=False,
+                                 help='Automatically select LLM layer before training using ILM scoring; Default is False')
+        self.parser.add_argument('--selection_samples', type=int, default=400,
+                                 help='Number of samples for layer selection; Default is 400')
+        self.parser.add_argument('--selection_pcs', type=int, default=16,
+                                 help='Number of principal components per layer for selection; Default is 16')
+        self.parser.add_argument('--selection_top_pc', type=int, default=5,
+                                 help='Top PCs by label-correlation to average; Default is 5')
+        self.parser.add_argument('--selection_layer_stride', type=int, default=1,
+                                 help='Stride for layer scoring (e.g., 2 scores every other layer); Default is 1')
+        self.parser.add_argument('--selection_pooling', type=str, choices=['first','mean'], default='mean',
+                                 help='Pooling for hidden states when scoring layers: first token (CLS) or mean; Default is mean')
+        self.parser.add_argument('--selection_split', type=str, choices=['train','validation','test'], default='validation',
+                                 help='Dataset split used for selection; Default is validation')
+        self.parser.add_argument('--selection_max_length', type=int, default=128,
+                                 help='Max token length for selection encoding (0 = inherit max_seq_len)')
+        self.parser.add_argument('--selection_dtype', type=str, choices=['fp16','fp32'], default='fp16',
+                                 help='LLM dtype for selection forward pass; Default is fp16 on CUDA, fp32 on CPU')
+        self.parser.add_argument('--selection_stratified', type=parse_bool, default=True,
+                                 help='Use stratified sampling for selection set; Default is True')
+        self.parser.add_argument('--selection_score_mode', type=str,
+                                 choices=['ilm_pca', 'mdl', 'ilm_head_patching'],
+                                 default='ilm_pca',
+                                 help='Scoring mode for ILM selection')
+        self.parser.add_argument('--mdl_n_portions', type=int, default=10,
+                                 help='Number of portions for MDL online coding; Default is 10')
+
         # Model - Optimizer & Scheduler arguments
         optim_list = ['SGD', 'AdaDelta', 'Adam', 'AdamW']
         scheduler_list = ['None', 'StepLR', 'LambdaLR', 'CosineAnnealingLR', 'CosineAnnealingWarmRestarts', 'ReduceLROnPlateau']
