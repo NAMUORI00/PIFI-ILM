@@ -88,6 +88,7 @@ class ApplyLayerResult:
     layer: int
     head_effects: np.ndarray
     base_acc: float
+    per_layer_probe_acc: Optional[List[float]] = None  # Probe accuracy for each layer
 
 
 def _train_val_split(y: np.ndarray, seed: int = 0, train_ratio: float = 0.8) -> Tuple[np.ndarray, np.ndarray]:
@@ -441,7 +442,7 @@ def identify_apply_layer(
     X_final = abstract.hidden_per_layer[-1]
     y = abstract.labels
     if X_final.shape[0] < 10:
-        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0, per_layer_probe_acc=None)
 
     train_idx, val_idx = _train_val_split(y, seed=seed, train_ratio=0.8)
     if val_limit and len(val_idx) > val_limit:
@@ -449,7 +450,19 @@ def identify_apply_layer(
         chosen = rng.choice(len(val_idx), size=val_limit, replace=False)
         val_idx = val_idx[chosen]
     if len(val_idx) == 0:
-        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0, per_layer_probe_acc=None)
+
+    # Compute per-layer probe accuracy
+    per_layer_probe_acc: List[float] = []
+    for layer_idx, X_layer in enumerate(abstract.hidden_per_layer):
+        try:
+            layer_clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto", random_state=seed)
+            layer_clf.fit(X_layer[train_idx], y[train_idx])
+            layer_acc = float(accuracy_score(y[val_idx], layer_clf.predict(X_layer[val_idx])))
+            per_layer_probe_acc.append(layer_acc)
+        except Exception:
+            per_layer_probe_acc.append(0.0)
+
     clf = LogisticRegression(max_iter=300, n_jobs=1, multi_class="auto", random_state=seed)
     try:
         clf.fit(X_final[train_idx], y[train_idx])
@@ -457,7 +470,7 @@ def identify_apply_layer(
         base_proba = clf.predict_proba(X_final[val_idx])  # (N_val, K)
         base_acc = float(accuracy_score(y[val_idx], clf.predict(X_final[val_idx])))
     except Exception:
-        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0)
+        return ApplyLayerResult(layer=-1, head_effects=np.zeros((0, 0), dtype=np.float32), base_acc=0.0, per_layer_probe_acc=per_layer_probe_acc)
 
     # Limit patching to the validation subset to keep runtime reasonable
     val_prompts = [abstract.prompts[i] for i in val_idx]
@@ -475,6 +488,7 @@ def identify_apply_layer(
             layer=-1,
             head_effects=np.zeros((num_layers, num_heads), dtype=np.float32),
             base_acc=base_acc,
+            per_layer_probe_acc=per_layer_probe_acc,
         )
 
     head_effects = np.zeros((num_layers, num_heads), dtype=np.float32)
@@ -521,7 +535,7 @@ def identify_apply_layer(
                 disable_patching()
 
     apply_layer = int(np.argmax(head_effects.sum(axis=1))) if head_effects.size > 0 else -1
-    return ApplyLayerResult(layer=apply_layer, head_effects=head_effects, base_acc=base_acc)
+    return ApplyLayerResult(layer=apply_layer, head_effects=head_effects, base_acc=base_acc, per_layer_probe_acc=per_layer_probe_acc)
 
 
 def auto_select_layer(args) -> int:
@@ -652,6 +666,10 @@ def auto_select_layer(args) -> int:
                 ],
                 "base_acc": float(apply.base_acc) if apply.layer >= 0 else None,
                 "max_head_effect": float(apply.head_effects.max()) if apply.head_effects.size > 0 else None,
+                # Full head_effects matrix for ILM heatmap visualization
+                "head_effects": apply.head_effects.tolist() if apply.head_effects.size > 0 else None,
+                # Per-layer probe accuracy for probe vs test accuracy analysis
+                "per_layer_probe_acc": apply.per_layer_probe_acc,
             }
             with open(log_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
